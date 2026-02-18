@@ -48,6 +48,7 @@ plugins:
             Runtime: "런타임"
             "Metal Kernels": "Metal 커널"
             Benchmarks: "벤치마크"
+            "Backend Porting": "백엔드 포팅"
       docs_structure: suffix
   - mkdocstrings:
       handlers:
@@ -79,6 +80,7 @@ nav:
     - "Usage Guide": usage.md
     - "Operator Support": operators.md
     - "Extension Guide": extending.md
+    - "Backend Porting": backend-porting.md
   - Benchmarks: benchmarks.md
   - "API Reference":
     - Overview: api/index.md
