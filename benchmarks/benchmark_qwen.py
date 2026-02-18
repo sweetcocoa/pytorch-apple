@@ -52,6 +52,7 @@ class RunMetrics:
     tps: float = 0.0              # tokens per second (decode, excluding first token)
     prefill_tps: float = 0.0      # prompt tokens / prefill time
     decode_tokens: int = 0        # actual decode tokens generated
+    per_step_tps: list[float] = field(default_factory=list)  # TPS at each decode step
 
 
 @dataclass
@@ -69,6 +70,7 @@ class ScenarioResult:
     prefill_tps_median: float = 0.0
     prefill_tps_std: float = 0.0
     actual_decode_tokens: int = 0
+    step_tps_median: list[float] = field(default_factory=list)  # per-step TPS (median across runs)
 
 
 @dataclass
@@ -199,7 +201,7 @@ def _npu_decode_loop(
     decode_executor, decode_program, decode_weights, prefill_outputs,
     prefill_program, kv_map, next_token, actual_len, max_tokens, device, tokenizer,
 ):
-    """Run NPU decode loop. Returns (tokens_generated, decode_time_sec)."""
+    """Run NPU decode loop. Returns (tokens_generated, decode_time_sec, step_times_ms)."""
     from npu_runtime.buffer import NPUBuffer
 
     prefill_seq_len = prefill_program.input_specs[0].shape[1]
@@ -227,9 +229,11 @@ def _npu_decode_loop(
             kv_buffers[dkey] = NPUBuffer.from_numpy(padded_kv, device, spec=decode_spec)
 
     generated = [next_token]
+    step_times_ms: list[float] = []
     t0 = time.perf_counter()
 
     for step in range(max_tokens - 1):
+        step_t0 = time.perf_counter()
         cur_pos = actual_len + step
         token_arr = np.array([[next_token]], dtype=np.int64)
         decode_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
@@ -261,6 +265,9 @@ def _npu_decode_loop(
         )
         next_token = int(np.argmax(dec_logits[0, -1, :]))
 
+        step_elapsed = (time.perf_counter() - step_t0) * 1000  # ms
+        step_times_ms.append(step_elapsed)
+
         if next_token == tokenizer.eos_token_id:
             break
         generated.append(next_token)
@@ -270,7 +277,7 @@ def _npu_decode_loop(
             kv_buffers[layer["decode_value_input"]] = decode_outputs[layer["decode_value_output"]]
 
     decode_time = time.perf_counter() - t0
-    return generated, decode_time
+    return generated, decode_time, step_times_ms
 
 
 def benchmark_npu_scenario(
@@ -301,7 +308,7 @@ def benchmark_npu_scenario(
             prefill_executor, prefill_program, prefill_weights, input_ids, device
         )
 
-        generated, decode_time = _npu_decode_loop(
+        generated, decode_time, step_times_ms = _npu_decode_loop(
             decode_executor, decode_program, decode_weights, outputs,
             prefill_program, kv_map, next_token, actual_len, decode_length,
             device, tokenizer,
@@ -311,17 +318,28 @@ def benchmark_npu_scenario(
         if i < warmup:
             continue
 
+        # Per-step TPS: 1 token / step_time_sec
+        per_step_tps = [1000.0 / t for t in step_times_ms if t > 0]
+
         m = RunMetrics(
             ttft_ms=prefill_time * 1000,
             tps=len(generated) / decode_time if decode_time > 0 else 0,
             prefill_tps=actual_prompt_len / prefill_time if prefill_time > 0 else 0,
             decode_tokens=len(generated),
+            per_step_tps=per_step_tps,
         )
         all_metrics.append(m)
 
     ttfts = [m.ttft_ms for m in all_metrics]
     tps_vals = [m.tps for m in all_metrics]
     prefill_vals = [m.prefill_tps for m in all_metrics]
+
+    # Compute per-step TPS median across runs (align by step index)
+    max_steps = max(len(m.per_step_tps) for m in all_metrics) if all_metrics else 0
+    step_tps_median = []
+    for step_idx in range(max_steps):
+        vals = [m.per_step_tps[step_idx] for m in all_metrics if step_idx < len(m.per_step_tps)]
+        step_tps_median.append(float(np.median(vals)))
 
     return ScenarioResult(
         scenario_id=scenario_id,
@@ -335,6 +353,7 @@ def benchmark_npu_scenario(
         prefill_tps_median=float(np.median(prefill_vals)),
         prefill_tps_std=float(np.std(prefill_vals)),
         actual_decode_tokens=all_metrics[-1].decode_tokens,
+        step_tps_median=step_tps_median,
     )
 
 
@@ -661,14 +680,14 @@ def print_report(report: BenchmarkReport, include_cpu: bool = True):
 
 
 def save_chart(report: BenchmarkReport, output_path: str, include_cpu: bool = True):
-    """Generate prompt_length vs TTFT and decode_length vs TPS charts."""
+    """Generate 3-panel benchmark chart: TTFT, per-step TPS, and throughput."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("  [WARN] matplotlib not installed, skipping chart generation")
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 
     # Chart 1: Prompt length vs TTFT
     ax = axes[0]
@@ -686,21 +705,48 @@ def save_chart(report: BenchmarkReport, output_path: str, include_cpu: bool = Tr
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Chart 2: Decode length vs TPS
+    # Chart 2: Per-step TPS vs decode position (use longest decode scenario)
     ax = axes[1]
-    decode_lens = [r.decode_length for r in report.npu_results]
-    tps_vals = [r.tps_median for r in report.npu_results]
-    tps_errs = [r.tps_std for r in report.npu_results]
-    ax.errorbar(decode_lens, tps_vals, yerr=tps_errs, marker="o", label="NPU (Metal)")
-    if include_cpu and report.cpu_results:
-        cpu_tps = [r.tps_median for r in report.cpu_results]
-        cpu_errs = [r.tps_std for r in report.cpu_results]
-        ax.errorbar(decode_lens, cpu_tps, yerr=cpu_errs, marker="s", label="CPU")
-    ax.set_xlabel("Decode Length (tokens)")
-    ax.set_ylabel("TPS (tokens/sec)")
-    ax.set_title("Decode Length vs TPS")
-    ax.legend()
+    longest = max(report.npu_results, key=lambda r: len(r.step_tps_median), default=None)
+    if longest and longest.step_tps_median:
+        steps = list(range(1, len(longest.step_tps_median) + 1))
+        ax.plot(steps, longest.step_tps_median, marker="", linewidth=1.2, color="#1f77b4")
+        ax.axhline(y=longest.tps_median, color="red", linestyle="--", alpha=0.7, label=f"Median: {longest.tps_median:.1f}")
+        ax.set_xlabel("Decode Step")
+        ax.set_ylabel("TPS (tokens/sec)")
+        ax.set_title(f"Per-Step TPS ({longest.scenario_id}: {longest.decode_length} tokens)")
+        ax.legend()
+    else:
+        ax.set_title("Per-Step TPS (no data)")
     ax.grid(True, alpha=0.3)
+
+    # Chart 3: Throughput bar chart (prefill + decode TPS per scenario)
+    ax = axes[2]
+    sids = [r.scenario_id for r in report.npu_results]
+    x = np.arange(len(sids))
+    width = 0.35
+
+    prefill_tps = [r.prefill_tps_median for r in report.npu_results]
+    decode_tps = [r.tps_median for r in report.npu_results]
+
+    bars1 = ax.bar(x - width / 2, prefill_tps, width, label="Prefill (tok/s)", alpha=0.8)
+    bars2 = ax.bar(x + width / 2, decode_tps, width, label="Decode (tok/s)", alpha=0.8)
+
+    # Add value labels on bars
+    for bar in bars1:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, h, f"{h:.0f}", ha="center", va="bottom", fontsize=7)
+    for bar in bars2:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2, h, f"{h:.0f}", ha="center", va="bottom", fontsize=7)
+
+    ax.set_xlabel("Scenario")
+    ax.set_ylabel("Throughput (tokens/sec)")
+    ax.set_title("Throughput by Scenario")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sids)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
@@ -733,6 +779,7 @@ def save_json(report: BenchmarkReport, output_path: str):
                 "prefill_tps_median": r.prefill_tps_median,
                 "prefill_tps_std": r.prefill_tps_std,
                 "actual_decode_tokens": r.actual_decode_tokens,
+                "step_tps_median": r.step_tps_median,
             }
             for r in report.npu_results
         ],
@@ -748,6 +795,7 @@ def save_json(report: BenchmarkReport, output_path: str):
                 "prefill_tps_median": r.prefill_tps_median,
                 "prefill_tps_std": r.prefill_tps_std,
                 "actual_decode_tokens": r.actual_decode_tokens,
+                "step_tps_median": r.step_tps_median,
             }
             for r in report.cpu_results
         ],

@@ -24,26 +24,29 @@ theme:
 plugins:
   - search
   - i18n:
-      default_language: en
       languages:
-        en: English
-        ko: Korean
-      default_language_only: false
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: ko
+          name: Korean
+          build: true
+          nav_translations:
+            Home: "홈"
+            Guide: "가이드"
+            "Concepts & Architecture": "개념 및 아키텍처"
+            Setup: "설치"
+            "Usage Guide": "사용 가이드"
+            "Operator Support": "연산자 지원"
+            "Extension Guide": "확장 가이드"
+            "API Reference": "API 레퍼런스"
+            Overview: "개요"
+            Compiler: "컴파일러"
+            Runtime: "런타임"
+            "Metal Kernels": "Metal 커널"
+            Benchmarks: "벤치마크"
       docs_structure: suffix
-      nav_translations:
-        ko:
-          Home: "홈"
-          Guide: "가이드"
-          "Concepts & Architecture": "개념 및 아키텍처"
-          Setup: "설치"
-          "Usage Guide": "사용 가이드"
-          "Operator Support": "연산자 지원"
-          "Extension Guide": "확장 가이드"
-          "API Reference": "API 레퍼런스"
-          Overview: "개요"
-          Compiler: "컴파일러"
-          Runtime: "런타임"
-          "Metal Kernels": "Metal 커널"
   - mkdocstrings:
       handlers:
         python:
@@ -74,6 +77,7 @@ nav:
     - "Usage Guide": usage.md
     - "Operator Support": operators.md
     - "Extension Guide": extending.md
+  - Benchmarks: benchmarks.md
   - "API Reference":
     - Overview: api/index.md
     - Compiler: api/compiler.md

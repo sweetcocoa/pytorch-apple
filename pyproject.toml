@@ -27,6 +27,7 @@ examples = [
     "huggingface-hub>=0.30",
     "safetensors>=0.7",
     "scipy>=1.14",
+    "matplotlib>=3.8",
 ]
 docs = [
     "mkdocs>=1.6",
