@@ -1,0 +1,86 @@
+# Setup
+
+## Requirements
+
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) package manager
+
+## Installation
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd npu-simulation/pytorch-apple
+
+# Install runtime dependencies
+uv sync
+
+# Install dev dependencies (for tests)
+uv sync --extra dev
+
+# Install example dependencies (for Qwen/ResNet demos)
+uv sync --extra examples
+
+# Install docs dependencies (for building documentation)
+uv sync --extra docs
+```
+
+## Project Structure
+
+```
+pytorch-apple/
+├── npu_compiler/           # Offline compilation pipeline
+│   ├── ir_reader.py        # Load torch_to_ir IR JSON
+│   ├── constraint_checker.py # NPU constraint validation
+│   ├── graph_optimizer.py  # BN folding, noop elimination
+│   ├── fusion_patterns.py  # Op fusion pattern matching
+│   ├── codegen.py          # Metal kernel code generation
+│   └── compiled_program.py # Serialization (.npubin)
+├── npu_runtime/            # Online execution on Metal GPU
+│   ├── device.py           # Metal device management
+│   ├── buffer.py           # NPUBuffer (GPU memory)
+│   ├── executor.py         # Command buffer batching
+│   ├── weight_loader.py    # safetensors → NPU buffers
+│   └── profiler.py         # Kernel timing measurement
+├── metal_kernels/          # Metal compute shaders
+│   ├── matmul.metal        # Tiled + vec matmul
+│   ├── conv_bn_relu.metal  # Conv2d with fusion
+│   ├── elementwise*.metal  # Element-wise ops
+│   ├── softmax.metal       # Softmax + masked softmax
+│   ├── rmsnorm.metal       # Fused RMSNorm
+│   ├── tensor_ops.metal    # Transpose, cat, slice, expand
+│   ├── embedding.metal     # Token embedding lookup
+│   ├── rope.metal          # Rotary position embedding
+│   └── ...
+├── tests/                  # Test suite
+├── examples/               # Demo scripts
+└── docs/                   # This documentation
+```
+
+## Dependencies
+
+### Runtime
+| Package | Purpose |
+|---------|---------|
+| `numpy` | Array operations |
+| `ml-dtypes` | BFloat16 support |
+| `pyobjc-framework-Metal` | Metal API bindings |
+| `pyobjc-framework-MetalPerformanceShaders` | MPS matmul |
+| `pytorch-ir` | IR extraction (torch_to_ir) |
+
+### Dev
+| Package | Purpose |
+|---------|---------|
+| `pytest` | Testing |
+| `torch` | Reference computations |
+| `ruff` | Linting |
+
+## Verification
+
+```bash
+# Run all tests
+uv run pytest tests/ -v
+
+# Expected: 85+ passed, 1-2 skipped (model download)
+```

@@ -1,0 +1,81 @@
+site_name: "NPU Simulation"
+site_description: "NPU compiler/runtime backend on Metal GPU"
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.sections
+    - navigation.expand
+    - search.highlight
+
+plugins:
+  - search
+  - i18n:
+      default_language: en
+      languages:
+        en: English
+        ko: Korean
+      default_language_only: false
+      docs_structure: suffix
+      nav_translations:
+        ko:
+          Home: "홈"
+          Guide: "가이드"
+          "Concepts & Architecture": "개념 및 아키텍처"
+          Setup: "설치"
+          "Usage Guide": "사용 가이드"
+          "Operator Support": "연산자 지원"
+          "Extension Guide": "확장 가이드"
+          "API Reference": "API 레퍼런스"
+          Overview: "개요"
+          Compiler: "컴파일러"
+          Runtime: "런타임"
+          "Metal Kernels": "Metal 커널"
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Guide:
+    - "Concepts & Architecture": concepts.md
+    - Setup: setup.md
+    - "Usage Guide": usage.md
+    - "Operator Support": operators.md
+    - "Extension Guide": extending.md
+  - "API Reference":
+    - Overview: api/index.md
+    - Compiler: api/compiler.md
+    - Runtime: api/runtime.md
+    - "Metal Kernels": api/kernels.md

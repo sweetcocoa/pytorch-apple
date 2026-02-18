@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.pytest_cache/
+.ruff_cache/
+
+# Claude Code
+.claude/
+CLAUDE.md
+EVALUATION_CRITERIA.md
+
+# Model weights & large files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Benchmark results
+benchmarks/results/
+
+# MkDocs build
+site/

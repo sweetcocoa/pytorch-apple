@@ -1,0 +1,111 @@
+# Concepts & Architecture
+
+## Pipeline Overview
+
+The NPU simulation pipeline has two phases: **offline compilation** and **online execution**.
+
+```mermaid
+graph TB
+    subgraph Offline ["Offline (npu_compiler)"]
+        A[IR JSON] --> B[Constraint Check]
+        B --> C[Graph Optimizer]
+        C --> D[Fusion Patterns]
+        D --> E[Code Generator]
+        E --> F[CompiledProgram .npubin]
+    end
+    subgraph Online ["Online (npu_runtime)"]
+        F --> G[Executor]
+        H[Weights .safetensors] --> I[Weight Loader]
+        I --> G
+        J[Input Data] --> G
+        G --> K[Metal GPU]
+        K --> L[Output]
+    end
+```
+
+## Compiler Pipeline
+
+### IR Reader
+Loads `torch_to_ir` JSON format into an internal `IRGraph` representation. The IR contains:
+
+- **graph_inputs/outputs** — tensor specifications with shapes and dtypes
+- **weights** — model parameters with shape metadata
+- **nodes** — operation graph (each node has op_type, inputs, outputs, attrs)
+- **weight_name_mapping** — maps FX placeholder names to state_dict keys
+
+### Constraint Checker
+Validates NPU constraints:
+
+- **Static shapes** — all tensor shapes must be compile-time constants
+- **Channel alignment** — 4D tensor channels padded to multiples of 64
+- **Supported ops** — rejects unsupported operation types
+
+### Graph Optimizer
+- **BN folding** — folds BatchNorm into Conv2d weights
+- **Noop elimination** — removes identity operations
+
+### Fusion Patterns
+Detects multi-op patterns and fuses them into single kernels:
+
+| Pattern | Ops Fused | Kernel |
+|---------|-----------|--------|
+| Conv+BN+ReLU | conv2d, batch_norm, relu | `conv2d_kernel` (flags) |
+| Add+ReLU | add, relu | `add_relu_kernel` |
+| RMSNorm | pow, mean, add, rsqrt, expand, mul, mul | `rmsnorm_kernel` |
+| SiLU+Mul | silu, mul | `silu_mul_kernel` |
+| Masked Softmax | add, softmax | `masked_softmax_kernel` |
+
+### Code Generator
+Maps each operation to Metal kernel calls with:
+
+- Kernel name and Metal source file
+- Input/output buffer bindings
+- Parameter struct (packed via `struct.pack`)
+- Dispatch type (1D/2D/3D) and grid dimensions
+
+Post-processing passes:
+
+- **Broadcast folding** — replaces expand+binary op with single broadcast kernel
+- **Transpose folding** — folds transpose into MPS matmul transpose flags
+
+## Runtime
+
+### Device
+Wraps the Metal device (via pyobjc) for:
+
+- Metal library compilation (`.metal` -> MTLLibrary)
+- Pipeline state creation
+- Command buffer/encoder management
+
+### Buffer (NPUBuffer)
+GPU memory management:
+
+- `from_numpy()` — upload with optional dtype cast and padding
+- `to_numpy()` — download with optional depad and dtype cast
+- `zeros()` — allocate zero-filled buffer with optional `alloc_shape`
+
+### Executor
+Batches all kernel dispatches into Metal command buffers:
+
+- **MPS acceleration** — uses `MPSMatrixMultiplication` for matmul (float16 + bfloat16)
+- **Pre-compiled pipelines** — all shaders compiled at init
+- **Pre-packed params** — parameter buffers packed once, reused across runs
+- **Buffer pool** — intermediate buffers allocated once at init
+
+### Weight Loader
+Loads safetensors weights with transform recipes:
+
+- BN folding (fold running_mean/var into conv weights)
+- Dtype conversion (float32 -> float16/bfloat16)
+- Channel padding (to 64-element alignment)
+
+## Compute Dtype
+
+The pipeline supports two compute types:
+
+| Dtype | Metal Type | Use Case |
+|-------|-----------|----------|
+| float16 | `half` | CNN models (ResNet) |
+| bfloat16 | `bfloat` | LLM models (Qwen) |
+
+Selected automatically based on IR weight dtypes. Metal shaders use `#ifdef USE_BFLOAT` to select the appropriate type.
