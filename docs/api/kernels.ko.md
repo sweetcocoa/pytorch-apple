@@ -38,7 +38,7 @@
 
 **파라미터**: `SoftmaxParams { rows, cols }`
 
-## 원소별 연산
+## 원소별 연산 {#elementwise}
 
 **파일**: `elementwise_extended.metal`
 
@@ -75,7 +75,7 @@
 |------|------|
 | `mean_last_dim_kernel` | 마지막 차원 평균 |
 
-## 브로드캐스트
+## 브로드캐스트 {#broadcast}
 
 **파일**: `elementwise_broadcast.metal`
 

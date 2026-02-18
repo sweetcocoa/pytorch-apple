@@ -23,6 +23,8 @@ theme:
 
 plugins:
   - search
+  - autorefs:
+      resolve_closest: true
   - i18n:
       languages:
         - locale: en
