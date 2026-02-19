@@ -1,5 +1,7 @@
 # 연산자 지원
 
+아래 나열된 op은 NPU에서 실행됩니다. 이 목록에 없는 op은 [그래프 파티션 파이프라인](partitioning.ko.md)을 통해 CPU fallback으로 자동 라우팅됩니다.
+
 ## 지원 연산 (50+)
 
 ### CNN 연산
@@ -8,6 +10,7 @@
 | `aten.conv2d.default` | `conv2d_kernel` | Groups, bias, padding, stride |
 | `aten.batch_norm.default` | (폴딩됨) | conv 가중치에 병합 |
 | `aten.relu.default` | `elementwise_relu` | conv/add와 퓨전 가능 |
+| `aten.relu_.default` | `elementwise_relu` | in-place 변형 |
 | `aten.max_pool2d.default` | `max_pool2d_kernel` | |
 | `aten.adaptive_avg_pool2d.default` | `adaptive_avg_pool2d_kernel` | |
 
@@ -33,6 +36,7 @@
 | 연산 타입 | Metal 커널 | 비고 |
 |----------|-----------|------|
 | `aten.add.Tensor` | `add_kernel` / `add_broadcast_kernel` | Broadcast 지원 |
+| `aten.add_.Tensor` | `add_kernel` | in-place 변형 |
 | `aten.mul.Tensor` | `mul_kernel` / `mul_broadcast_kernel` | Broadcast 지원 |
 | `aten.div.Tensor` | `div_kernel` / `div_broadcast_kernel` | Broadcast 지원 |
 
@@ -85,3 +89,4 @@
 | `aten.to.dtype` | 항등 (dtype은 경계에서 처리) |
 | `aten.dropout.default` | 항등 (평가 모드) |
 | `<built-in function getitem>` | 다중 출력 인덱스 |
+| `aten._assert_tensor_metadata.default` | 메타데이터 어서션 (no-op) |

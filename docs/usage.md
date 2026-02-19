@@ -5,8 +5,10 @@
 ```mermaid
 graph LR
     A[PyTorch Model] -->|torch_to_ir| B[IR JSON]
-    B -->|compile_ir| C[.npubin]
+    B -->|compile| C[.npubin]
     C -->|Executor| D[GPU Output]
+    B -->|partition| E[PartitionPlan]
+    E -->|DAGExecutor| D
 ```
 
 ## ResNet Example
@@ -30,15 +32,12 @@ ir.save("resnet18_ir.json")
 ### Compile and Execute
 
 ```python
-from npu_compiler import compile_ir
+import npu_compiler
 from npu_compiler.compiled_program import CompiledProgram
-from npu_runtime.device import Device
-from npu_runtime.executor import Executor
-from npu_runtime.weight_loader import load_weights
-from npu_runtime.buffer import NPUBuffer
+from npu_runtime import Device, Executor, NPUBuffer, load_weights
 
 # Compile
-program = compile_ir("resnet18_ir.json")
+program = npu_compiler.compile("resnet18_ir.json")
 program.save("resnet18.npubin")
 
 # Setup runtime
@@ -57,43 +56,41 @@ logits = outputs[program.output_specs[0].name].to_numpy(spec=program.output_spec
 
 ## Qwen2.5-1.5B Example
 
-Qwen uses a two-phase approach: **prefill** (process prompt) and **decode** (generate tokens).
+Qwen uses the **graph partition pipeline** (DAGExecutor) for mixed NPU + CPU execution.
 
-### Prefill Phase
+### Via DAGExecutor (recommended)
 ```python
-# Compile prefill IR (variable sequence length)
-prefill_program = compile_ir("qwen_prefill_ir.json")
-prefill_executor = Executor(prefill_program, device)
+import json
+from npu_compiler import partition, is_op_supported
+from npu_runtime import DAGExecutor, MetalBackend
 
-# Run prefill with prompt tokens
-prefill_outputs = prefill_executor.run(
-    inputs={
-        "input_ids": token_buf,
-        "attention_mask": mask_buf,
-        "position_ids": pos_buf,
-    },
-    weights=weights,
-)
+ir_dict = json.load(open("qwen_prefill_ir.json"))
+plan = partition(ir_dict, is_op_supported)
+
+backend = MetalBackend()
+dag = DAGExecutor(plan, backend)
+dag.load_weights(weights_dict)
+
+result = dag.execute(inputs={
+    "input_ids": input_ids_np,
+    "attention_mask": causal_mask_np,
+    "position_ids": position_ids_np,
+    "cache_position": cache_position_np,
+})
+logits = list(result.values())[0]
+next_token = logits[0, -1, :].argmax()
 ```
 
-### Decode Phase
+### Via single Executor (all ops NPU-supported)
 ```python
-# Compile decode IR (single token, KV cache)
-decode_program = compile_ir("qwen_decode_ir.json")
-decode_executor = Executor(decode_program, device)
+import npu_compiler
+from npu_runtime import Device, Executor, load_weights
 
-# Autoregressive generation
-for step in range(max_tokens):
-    outputs = decode_executor.run(
-        inputs={
-            "input_ids": next_token_buf,
-            "cache_position": cache_pos_buf,
-            "position_ids": pos_buf,
-            "attention_mask": mask_buf,
-        },
-        weights=weights,
-    )
-    next_token = outputs["logits"].to_numpy(spec=...).argmax()
+prefill_program = npu_compiler.compile("qwen_prefill_ir.json")
+device = Device()
+executor = Executor(prefill_program, device)
+weights = load_weights("model.safetensors", prefill_program, device)
+outputs = executor.run(inputs={...}, weights=weights)
 ```
 
 ## Profiling

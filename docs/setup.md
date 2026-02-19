@@ -36,11 +36,17 @@ pytorch-apple/
 │   ├── graph_optimizer.py  # BN folding, noop elimination
 │   ├── fusion_patterns.py  # Op fusion pattern matching
 │   ├── codegen.py          # Metal kernel code generation
-│   └── compiled_program.py # Serialization (.npubin)
+│   ├── compiled_program.py # Serialization (.npubin)
+│   ├── op_support.py       # Op support table (is_op_supported)
+│   └── partitioner.py      # Graph partitioning (NPU/CPU split)
 ├── npu_runtime/            # Online execution on Metal GPU
+│   ├── backend.py          # Backend ABC (hardware-agnostic)
+│   ├── metal_backend.py    # MetalBackend implementation
 │   ├── device.py           # Metal device management
 │   ├── buffer.py           # NPUBuffer (GPU memory)
-│   ├── executor.py         # Command buffer batching
+│   ├── executor.py         # Command buffer batching (single program)
+│   ├── dag_executor.py     # DAGExecutor (mixed NPU + CPU)
+│   ├── cpu_fallback.py     # CPU fallback via torch_ir
 │   ├── weight_loader.py    # safetensors → NPU buffers
 │   └── profiler.py         # Kernel timing measurement
 ├── metal_kernels/          # Metal compute shaders
@@ -67,7 +73,7 @@ pytorch-apple/
 | `ml-dtypes` | BFloat16 support |
 | `pyobjc-framework-Metal` | Metal API bindings |
 | `pyobjc-framework-MetalPerformanceShaders` | MPS matmul |
-| `pytorch-ir` | IR extraction (torch_to_ir) |
+| `pytorch-ir` | IR extraction + CPU fallback execution (torch_to_ir) |
 
 ### Dev
 | Package | Purpose |
@@ -82,5 +88,5 @@ pytorch-apple/
 # Run all tests
 uv run pytest tests/ -v
 
-# Expected: 85+ passed, 1-2 skipped (model download)
+# Expected: 180+ passed, 1-2 skipped (model download)
 ```

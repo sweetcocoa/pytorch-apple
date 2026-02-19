@@ -2,7 +2,7 @@
 
 ## 파이프라인 개요
 
-NPU 시뮬레이션 파이프라인은 **오프라인 컴파일**과 **온라인 실행** 두 단계로 구성됩니다.
+NPU 시뮬레이션 파이프라인은 **오프라인 컴파일**과 **온라인 실행** 두 단계로 구성됩니다. **단일 프로그램** (모든 op NPU 지원)과 **그래프 파티션** (NPU + CPU 혼합) 두 가지 실행 경로가 있습니다.
 
 ```mermaid
 graph TB
@@ -12,14 +12,21 @@ graph TB
         C --> D[퓨전 패턴]
         D --> E[코드 생성]
         E --> F[CompiledProgram .npubin]
+        A --> P[Op 지원 확인]
+        P --> Q[Partitioner]
+        Q --> R[PartitionPlan]
     end
     subgraph Online ["온라인 (npu_runtime)"]
         F --> G[Executor]
-        H[가중치 .safetensors] --> I[Weight Loader]
+        H[가중치] --> I[Weight Loader]
         I --> G
         J[입력 데이터] --> G
         G --> K[Metal GPU]
         K --> L[출력]
+        R --> DAG[DAGExecutor]
+        H --> DAG
+        J --> DAG
+        DAG --> K
     end
 ```
 
@@ -34,11 +41,19 @@ graph TB
 - **weight_name_mapping** — FX placeholder 이름 -> state_dict 키 매핑
 
 ### Constraint Checker
-NPU 제약 조건 검증:
+단일 프로그램 `compile()` 경로의 NPU 제약 조건 검증:
 
 - **정적 형상** — 모든 텐서 형상은 컴파일 시점에 결정
 - **채널 정렬** — 4D 텐서 채널을 64의 배수로 패딩
-- **지원 연산** — 미지원 연산 타입 거부
+- **지원 연산** — 미지원 연산 타입 거부 (파티션 경로에서는 미지원 op이 CPU로 라우팅)
+
+### Op Support + Partitioner
+미지원 op이 있는 모델의 경우, 파티션 경로가 IR을 분할합니다:
+
+- **op_support.py** — `is_op_supported(op_type)`로 50+ 지원 op 확인
+- **partitioner.py** — `partition(ir_dict, is_supported_fn)`이 동일 target 연속 노드를 그룹핑하고, 디바이스 경계에 `TransferOp`을 삽입하여 `PartitionPlan` 반환
+
+자세한 내용은 [그래프 파티셔닝](partitioning.ko.md)을 참조하세요.
 
 ### Graph Optimizer
 - **BN 폴딩** — BatchNorm을 Conv2d 가중치에 병합
@@ -98,6 +113,24 @@ safetensors 가중치를 변환 레시피와 함께 로드:
 - BN 폴딩 (running_mean/var를 conv 가중치에 병합)
 - Dtype 변환 (float32 -> float16/bfloat16)
 - 채널 패딩 (64 원소 정렬)
+
+### Backend ABC + MetalBackend
+하드웨어 독립적 NPU 실행 인터페이스:
+
+- `Backend` — `create_executor()`, `allocate_buffer()`, `device` 속성을 가진 추상 기반 클래스
+- `MetalBackend` — pyobjc 기반 Metal GPU 구현
+- `DeviceBuffer` — `to_numpy()` / `from_numpy()`를 가진 디바이스 메모리 추상화
+
+### DAGExecutor
+`PartitionPlan`에 따라 NPU + CPU 혼합 실행을 오케스트레이션:
+
+- NPU 파티션은 초기화 시 `npu_compiler.compile(sub_ir_dict)`로 컴파일
+- CPU 파티션은 `torch_ir.IRExecutor`로 실행 (ATen fallback)
+- Transfer op이 디바이스 간 텐서 이동 (bfloat16 dtype 보존)
+- `load_weights()`로 NPU 가중치 버퍼를 사전 캐시하여 실행 간 재사용
+
+### CPU Fallback
+`execute_cpu_partition()`이 `torch_ir.IRExecutor`를 사용하여 미지원 op을 CPU에서 실행합니다. `ml_dtypes`를 통한 bfloat16 포함 numpy↔torch 텐서 변환을 처리합니다.
 
 ## 연산 Dtype
 

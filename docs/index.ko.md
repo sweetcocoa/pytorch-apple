@@ -21,19 +21,16 @@ ir = extract_ir(model, example_input, model_name="my_model")
 ### 2. NPU 프로그램으로 컴파일
 
 ```python
-from npu_compiler import compile_ir
-program = compile_ir("model_ir.json")
+import npu_compiler
+program = npu_compiler.compile("model_ir.json")
 program.save("model.npubin")
 ```
 
-### 3. Metal GPU에서 실행
+### 3a. Metal GPU에서 실행 (단일 프로그램 — 모든 op NPU 지원)
 
 ```python
 from npu_compiler.compiled_program import CompiledProgram
-from npu_runtime.device import Device
-from npu_runtime.executor import Executor
-from npu_runtime.weight_loader import load_weights
-from npu_runtime.buffer import NPUBuffer
+from npu_runtime import Device, Executor, NPUBuffer, load_weights
 
 device = Device()
 program = CompiledProgram.load("model.npubin")
@@ -43,6 +40,19 @@ weights = load_weights("model.safetensors", program, device)
 input_buf = NPUBuffer.from_numpy(input_data, device, spec=program.input_specs[0])
 outputs = executor.run(inputs={"input": input_buf}, weights=weights)
 result = outputs["output"].to_numpy(spec=program.output_specs[0])
+```
+
+### 3b. DAGExecutor로 실행 (혼합 NPU + CPU — 부분 op 지원)
+
+```python
+from npu_compiler import partition, is_op_supported
+from npu_runtime import DAGExecutor, MetalBackend
+
+plan = partition(ir_dict, is_op_supported)
+backend = MetalBackend()
+dag = DAGExecutor(plan, backend)
+dag.load_weights(weights_dict)
+result = dag.execute(inputs={"x": input_array})
 ```
 
 ## 성능
@@ -61,9 +71,13 @@ result = outputs["output"].to_numpy(spec=program.output_specs[0])
 graph LR
     A[PyTorch 모델] --> B[torch_to_ir]
     B --> C[IR JSON]
-    C --> D[npu_compiler]
-    D --> E[CompiledProgram .npubin]
-    E --> F[npu_runtime]
-    G[가중치 .safetensors] --> F
-    F --> H[Metal GPU 실행]
+    C --> D1[npu_compiler.compile]
+    D1 --> E[CompiledProgram .npubin]
+    E --> F1[Executor]
+    G[가중치] --> F1
+    F1 --> H[Metal GPU]
+    C --> D2[partition + DAGExecutor]
+    D2 --> F2[NPU + CPU 혼합]
+    G --> F2
+    F2 --> H
 ```

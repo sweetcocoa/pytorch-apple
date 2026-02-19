@@ -69,13 +69,19 @@ if node.op_type == "aten.my_op.default":
 - `f` = float32
 - `6I` = 6개 uint32 배열 (리스트 파라미터에서 자동 언패킹)
 
-### 4. Constraint Checker에 등록
+### 4. Op 지원 테이블에 등록
 
-`npu_compiler/constraint_checker.py`의 지원 연산 집합에 추가:
+`npu_compiler/codegen.py`의 `HANDLED_OPS`(constraint checker가 여기서 임포트)와 `npu_compiler/op_support.py`의 `_SUPPORTED_OPS`(그래프 파티셔너 사용) 모두에 추가:
 
 ```python
+# npu_compiler/codegen.py — HANDLED_OPS 집합
+HANDLED_OPS.add("aten.my_op.default")
+
+# npu_compiler/op_support.py — _SUPPORTED_OPS 집합
 _SUPPORTED_OPS.add("aten.my_op.default")
 ```
+
+두 집합은 동기화되어야 합니다. `HANDLED_OPS`는 단일 프로그램 컴파일 경로를, `_SUPPORTED_OPS`는 파티션 경로를 제어합니다 (`_SUPPORTED_OPS`에 없는 op은 DAGExecutor를 통해 CPU로 fallback).
 
 ### 5. 테스트 추가
 

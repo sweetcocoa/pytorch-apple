@@ -70,13 +70,19 @@ The format string uses `struct.pack` format codes:
 - `f` = float32
 - `6I` = array of 6 uint32s (auto-unpacked from list params)
 
-### 4. Register in Constraint Checker
+### 4. Register in Op Support Table
 
-In `npu_compiler/constraint_checker.py`, add to the supported ops set:
+Add to `HANDLED_OPS` in `npu_compiler/codegen.py` (the constraint checker imports from there) and to `_SUPPORTED_OPS` in `npu_compiler/op_support.py` (used by the graph partitioner):
 
 ```python
+# npu_compiler/codegen.py — HANDLED_OPS set
+HANDLED_OPS.add("aten.my_op.default")
+
+# npu_compiler/op_support.py — _SUPPORTED_OPS set
 _SUPPORTED_OPS.add("aten.my_op.default")
 ```
+
+Both sets must stay in sync. `HANDLED_OPS` controls the single-program compile path; `_SUPPORTED_OPS` controls the partition path (ops not in `_SUPPORTED_OPS` fall back to CPU via DAGExecutor).
 
 ### 5. Add Tests
 

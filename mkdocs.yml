@@ -42,6 +42,7 @@ plugins:
             "Usage Guide": "사용 가이드"
             "Operator Support": "연산자 지원"
             "Extension Guide": "확장 가이드"
+            "Graph Partitioning": "그래프 파티셔닝"
             "API Reference": "API 레퍼런스"
             Overview: "개요"
             Compiler: "컴파일러"
@@ -80,6 +81,7 @@ nav:
     - "Usage Guide": usage.md
     - "Operator Support": operators.md
     - "Extension Guide": extending.md
+    - "Graph Partitioning": partitioning.md
     - "Backend Porting": backend-porting.md
   - Benchmarks: benchmarks.md
   - "API Reference":

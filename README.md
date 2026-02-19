@@ -19,26 +19,29 @@ uv sync --extra dev
 # Run tests
 uv run pytest tests/ -v
 
-# Run Qwen example
+# Run Qwen example (graph partition pipeline)
 uv sync --extra examples
-cd examples && uv run python run_qwen.py --prompt "Hello" --max-tokens 8
+cd examples && uv run python run_qwen_graph.py --prompt "Hello"
 ```
 
 ## Architecture
 
 ```
-PyTorch Model → torch_to_ir → IR JSON → npu_compiler → .npubin → npu_runtime → Metal GPU
+PyTorch Model → torch_to_ir → IR JSON ─┬─→ compile()  → .npubin → Executor → Metal GPU
+                                        └─→ partition() → DAGExecutor → NPU + CPU mixed
 ```
 
 ### Compiler (offline)
 - IR loading, constraint validation, BN folding
 - Op fusion: Conv+BN+ReLU, Add+ReLU, RMSNorm, SiLU+Gate, Masked Softmax
 - Broadcast folding, transpose folding into MPS matmul
+- **Graph partitioning**: splits IR into NPU/CPU partitions for models with unsupported ops
 
 ### Runtime (online)
 - MPS-accelerated matmul (float16 + bfloat16)
 - Pre-compiled shaders, pre-packed parameters
 - Single command buffer batching
+- **DAGExecutor**: mixed NPU + CPU fallback execution via Backend ABC
 
 ## Performance Optimizations
 
@@ -62,4 +65,4 @@ Available in English and Korean.
 
 ## 50+ Supported Ops
 
-CNN, linear algebra, element-wise, tensor manipulation, reductions, positional encoding, and fused kernels. See [docs/operators.md](docs/operators.md) for the full list.
+CNN, linear algebra, element-wise, tensor manipulation, reductions, positional encoding, and fused kernels. See [docs/operators.md](docs/operators.md) for the full list. Ops not in this list are automatically routed to CPU fallback via the [graph partition pipeline](docs/partitioning.md).

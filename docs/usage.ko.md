@@ -5,8 +5,10 @@
 ```mermaid
 graph LR
     A[PyTorch 모델] -->|torch_to_ir| B[IR JSON]
-    B -->|compile_ir| C[.npubin]
+    B -->|compile| C[.npubin]
     C -->|Executor| D[GPU 출력]
+    B -->|partition| E[PartitionPlan]
+    E -->|DAGExecutor| D
 ```
 
 ## ResNet 예제
@@ -30,15 +32,12 @@ ir.save("resnet18_ir.json")
 ### 컴파일 및 실행
 
 ```python
-from npu_compiler import compile_ir
+import npu_compiler
 from npu_compiler.compiled_program import CompiledProgram
-from npu_runtime.device import Device
-from npu_runtime.executor import Executor
-from npu_runtime.weight_loader import load_weights
-from npu_runtime.buffer import NPUBuffer
+from npu_runtime import Device, Executor, NPUBuffer, load_weights
 
 # 컴파일
-program = compile_ir("resnet18_ir.json")
+program = npu_compiler.compile("resnet18_ir.json")
 program.save("resnet18.npubin")
 
 # 런타임 설정
@@ -57,43 +56,41 @@ logits = outputs[program.output_specs[0].name].to_numpy(spec=program.output_spec
 
 ## Qwen2.5-1.5B 예제
 
-Qwen은 두 단계를 사용합니다: **프리필** (프롬프트 처리)과 **디코드** (토큰 생성).
+Qwen은 **그래프 파티션 파이프라인** (DAGExecutor)을 사용하여 NPU + CPU 혼합 실행합니다.
 
-### 프리필 단계
+### DAGExecutor 방식 (권장)
 ```python
-# 프리필 IR 컴파일
-prefill_program = compile_ir("qwen_prefill_ir.json")
-prefill_executor = Executor(prefill_program, device)
+import json
+from npu_compiler import partition, is_op_supported
+from npu_runtime import DAGExecutor, MetalBackend
 
-# 프롬프트 토큰으로 프리필 실행
-prefill_outputs = prefill_executor.run(
-    inputs={
-        "input_ids": token_buf,
-        "attention_mask": mask_buf,
-        "position_ids": pos_buf,
-    },
-    weights=weights,
-)
+ir_dict = json.load(open("qwen_prefill_ir.json"))
+plan = partition(ir_dict, is_op_supported)
+
+backend = MetalBackend()
+dag = DAGExecutor(plan, backend)
+dag.load_weights(weights_dict)
+
+result = dag.execute(inputs={
+    "input_ids": input_ids_np,
+    "attention_mask": causal_mask_np,
+    "position_ids": position_ids_np,
+    "cache_position": cache_position_np,
+})
+logits = list(result.values())[0]
+next_token = logits[0, -1, :].argmax()
 ```
 
-### 디코드 단계
+### 단일 Executor 방식 (모든 op NPU 지원 시)
 ```python
-# 디코드 IR 컴파일 (단일 토큰, KV 캐시)
-decode_program = compile_ir("qwen_decode_ir.json")
-decode_executor = Executor(decode_program, device)
+import npu_compiler
+from npu_runtime import Device, Executor, load_weights
 
-# 자기회귀 생성
-for step in range(max_tokens):
-    outputs = decode_executor.run(
-        inputs={
-            "input_ids": next_token_buf,
-            "cache_position": cache_pos_buf,
-            "position_ids": pos_buf,
-            "attention_mask": mask_buf,
-        },
-        weights=weights,
-    )
-    next_token = outputs["logits"].to_numpy(spec=...).argmax()
+prefill_program = npu_compiler.compile("qwen_prefill_ir.json")
+device = Device()
+executor = Executor(prefill_program, device)
+weights = load_weights("model.safetensors", prefill_program, device)
+outputs = executor.run(inputs={...}, weights=weights)
 ```
 
 ## 프로파일링

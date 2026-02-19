@@ -1,5 +1,7 @@
 # Operator Support
 
+Ops listed below run on the NPU. Ops not in this list are automatically routed to CPU fallback via the [graph partition pipeline](partitioning.md).
+
 ## Supported Operations (50+)
 
 ### CNN Operations
@@ -8,6 +10,7 @@
 | `aten.conv2d.default` | `conv2d_kernel` | Groups, bias, padding, stride |
 | `aten.batch_norm.default` | (folded) | Folded into conv weights |
 | `aten.relu.default` | `elementwise_relu` | Also fused with conv/add |
+| `aten.relu_.default` | `elementwise_relu` | In-place variant |
 | `aten.max_pool2d.default` | `max_pool2d_kernel` | |
 | `aten.adaptive_avg_pool2d.default` | `adaptive_avg_pool2d_kernel` | |
 
@@ -33,6 +36,7 @@
 | Op Type | Metal Kernel | Notes |
 |---------|-------------|-------|
 | `aten.add.Tensor` | `add_kernel` / `add_broadcast_kernel` | Broadcast-aware |
+| `aten.add_.Tensor` | `add_kernel` | In-place variant |
 | `aten.mul.Tensor` | `mul_kernel` / `mul_broadcast_kernel` | Broadcast-aware |
 | `aten.div.Tensor` | `div_kernel` / `div_broadcast_kernel` | Broadcast-aware |
 
@@ -85,3 +89,4 @@
 | `aten.to.dtype` | Identity (dtype handled at boundary) |
 | `aten.dropout.default` | Identity (eval mode) |
 | `<built-in function getitem>` | Multi-output index |
+| `aten._assert_tensor_metadata.default` | Metadata assertion (no-op) |

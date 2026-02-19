@@ -2,7 +2,7 @@
 
 ## Pipeline Overview
 
-The NPU simulation pipeline has two phases: **offline compilation** and **online execution**.
+The NPU simulation pipeline has two phases: **offline compilation** and **online execution**. There are two execution paths: **single program** (all ops NPU-supported) and **graph partition** (mixed NPU + CPU).
 
 ```mermaid
 graph TB
@@ -12,14 +12,21 @@ graph TB
         C --> D[Fusion Patterns]
         D --> E[Code Generator]
         E --> F[CompiledProgram .npubin]
+        A --> P[Op Support Check]
+        P --> Q[Partitioner]
+        Q --> R[PartitionPlan]
     end
     subgraph Online ["Online (npu_runtime)"]
         F --> G[Executor]
-        H[Weights .safetensors] --> I[Weight Loader]
+        H[Weights] --> I[Weight Loader]
         I --> G
         J[Input Data] --> G
         G --> K[Metal GPU]
         K --> L[Output]
+        R --> DAG[DAGExecutor]
+        H --> DAG
+        J --> DAG
+        DAG --> K
     end
 ```
 
@@ -34,11 +41,19 @@ Loads `torch_to_ir` JSON format into an internal `IRGraph` representation. The I
 - **weight_name_mapping** — maps FX placeholder names to state_dict keys
 
 ### Constraint Checker
-Validates NPU constraints:
+Validates NPU constraints for the single-program `compile()` path:
 
 - **Static shapes** — all tensor shapes must be compile-time constants
 - **Channel alignment** — 4D tensor channels padded to multiples of 64
-- **Supported ops** — rejects unsupported operation types
+- **Supported ops** — rejects unsupported operation types (for the partition path, unsupported ops are routed to CPU instead)
+
+### Op Support + Partitioner
+For models with unsupported ops, the partition path splits the IR:
+
+- **op_support.py** — `is_op_supported(op_type)` checks against 50+ supported ops
+- **partitioner.py** — `partition(ir_dict, is_supported_fn)` groups consecutive same-target nodes, inserts `TransferOp` at device boundaries, returns a `PartitionPlan`
+
+See [Graph Partitioning](partitioning.md) for details.
 
 ### Graph Optimizer
 - **BN folding** — folds BatchNorm into Conv2d weights
@@ -98,6 +113,24 @@ Loads safetensors weights with transform recipes:
 - BN folding (fold running_mean/var into conv weights)
 - Dtype conversion (float32 -> float16/bfloat16)
 - Channel padding (to 64-element alignment)
+
+### Backend ABC + MetalBackend
+Hardware-agnostic interface for NPU execution:
+
+- `Backend` — abstract base class with `create_executor()`, `allocate_buffer()`, `device` property
+- `MetalBackend` — Metal GPU implementation via pyobjc
+- `DeviceBuffer` — device memory abstraction with `to_numpy()` / `from_numpy()`
+
+### DAGExecutor
+Orchestrates mixed NPU + CPU execution from a `PartitionPlan`:
+
+- NPU partitions compiled via `npu_compiler.compile(sub_ir_dict)` at init time
+- CPU partitions executed via `torch_ir.IRExecutor` (ATen fallback)
+- Transfer ops move tensors between devices (bfloat16 dtype preserved)
+- `load_weights()` pre-caches NPU weight buffers for reuse across runs
+
+### CPU Fallback
+`execute_cpu_partition()` runs unsupported ops on CPU using `torch_ir.IRExecutor`. Handles numpy↔torch tensor conversion including bfloat16 via `ml_dtypes`.
 
 ## Compute Dtype
 
