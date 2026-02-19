@@ -12,6 +12,9 @@ dependencies = [
     "pytorch-ir",
 ]
 
+[tool.uv.sources]
+pytorch-ir = { path = "../torch_to_ir", editable = true }
+
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0",

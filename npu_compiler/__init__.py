@@ -5,13 +5,26 @@ from npu_compiler.fusion_patterns import find_fusion_groups as find_fusion_group
 from npu_compiler.graph_optimizer import eliminate_noop_ops, fold_batch_norms
 from npu_compiler.ir_reader import IRGraph, load_ir
 from npu_compiler.ir_reader import load_ir_from_dict as load_ir_from_dict
+from npu_compiler.op_support import get_supported_ops as get_supported_ops
+from npu_compiler.op_support import is_op_supported as is_op_supported
+from npu_compiler.partitioner import Partition as Partition
+from npu_compiler.partitioner import PartitionPlan as PartitionPlan
+from npu_compiler.partitioner import TransferOp as TransferOp
+from npu_compiler.partitioner import partition as partition
 from npu_compiler.target_config import METAL_GPU as METAL_GPU
 from npu_compiler.target_config import TargetConfig as TargetConfig
 
 
-def compile(ir_path: str) -> CompiledProgram:
-    """Compile an IR JSON file to a CompiledProgram."""
-    graph = load_ir(ir_path)
+def compile(ir: str | dict) -> CompiledProgram:
+    """Compile an IR to a CompiledProgram.
+
+    Args:
+        ir: Either a path to an IR JSON file (str) or an in-memory IR dict.
+    """
+    if isinstance(ir, str):
+        graph = load_ir(ir)
+    else:
+        graph = load_ir_from_dict(ir)
     return compile_graph(graph)
 
 

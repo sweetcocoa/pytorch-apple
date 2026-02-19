@@ -13,23 +13,19 @@ class DeviceBuffer(ABC):
 
     @property
     @abstractmethod
-    def shape(self) -> tuple[int, ...]:
-        ...
+    def shape(self) -> tuple[int, ...]: ...
 
     @property
     @abstractmethod
-    def alloc_shape(self) -> tuple[int, ...]:
-        ...
+    def alloc_shape(self) -> tuple[int, ...]: ...
 
     @property
     @abstractmethod
-    def dtype(self) -> np.dtype:
-        ...
+    def dtype(self) -> np.dtype: ...
 
     @property
     @abstractmethod
-    def size_bytes(self) -> int:
-        ...
+    def size_bytes(self) -> int: ...
 
     @property
     @abstractmethod
@@ -38,8 +34,7 @@ class DeviceBuffer(ABC):
         ...
 
     @abstractmethod
-    def to_numpy(self, spec=None) -> np.ndarray:
-        ...
+    def to_numpy(self, spec=None) -> np.ndarray: ...
 
 
 class Backend(ABC):
@@ -47,20 +42,22 @@ class Backend(ABC):
 
     @property
     @abstractmethod
-    def name(self) -> str:
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def device(self) -> Any:
+        """Backend-native device object (e.g. Device for Metal)."""
         ...
 
     @abstractmethod
-    def allocate_buffer(self, data: np.ndarray, alloc_shape=None, spec=None) -> DeviceBuffer:
-        ...
+    def allocate_buffer(self, data: np.ndarray, alloc_shape=None, spec=None) -> DeviceBuffer: ...
 
     @abstractmethod
-    def allocate_zeros(self, shape, dtype=np.dtype(np.float16), alloc_shape=None) -> DeviceBuffer:
-        ...
+    def allocate_zeros(self, shape, dtype=np.dtype(np.float16), alloc_shape=None) -> DeviceBuffer: ...
 
     @abstractmethod
-    def execute(self, program, inputs, weights) -> dict[str, DeviceBuffer]:
-        ...
+    def execute(self, program, inputs, weights) -> dict[str, DeviceBuffer]: ...
 
     @abstractmethod
     def create_executor(self, program) -> Any:
@@ -68,5 +65,4 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    def synchronize(self):
-        ...
+    def synchronize(self): ...

@@ -42,8 +42,14 @@ class NPUBuffer(DeviceBuffer):
     is in _alloc_shape. The compiler decides alloc_shape; the runtime applies it.
     """
 
-    def __init__(self, mtl_buffer, shape: tuple[int, ...], dtype: np.dtype,
-                 device: Device, alloc_shape: tuple[int, ...] | None = None):
+    def __init__(
+        self,
+        mtl_buffer,
+        shape: tuple[int, ...],
+        dtype: np.dtype,
+        device: Device,
+        alloc_shape: tuple[int, ...] | None = None,
+    ):
         self._buffer = mtl_buffer
         self._shape = shape
         self._alloc_shape = alloc_shape or shape
@@ -75,9 +81,9 @@ class NPUBuffer(DeviceBuffer):
         return int(np.prod(self._alloc_shape)) * self._dtype.itemsize
 
     @staticmethod
-    def from_numpy(data: np.ndarray, device: Device,
-                   alloc_shape: tuple[int, ...] | None = None,
-                   spec: TensorSpec | None = None) -> NPUBuffer:
+    def from_numpy(
+        data: np.ndarray, device: Device, alloc_shape: tuple[int, ...] | None = None, spec: TensorSpec | None = None
+    ) -> NPUBuffer:
         """Create NPU buffer from numpy array.
 
         Args:
@@ -118,8 +124,12 @@ class NPUBuffer(DeviceBuffer):
         return NPUBuffer(mtl_buffer, logical_shape, contiguous.dtype, device, final_alloc_shape)
 
     @staticmethod
-    def zeros(shape: tuple[int, ...], device: Device, dtype: np.dtype = np.dtype(np.float16),
-              alloc_shape: tuple[int, ...] | None = None) -> NPUBuffer:
+    def zeros(
+        shape: tuple[int, ...],
+        device: Device,
+        dtype: np.dtype = np.dtype(np.float16),
+        alloc_shape: tuple[int, ...] | None = None,
+    ) -> NPUBuffer:
         """Create a zero-initialized NPU buffer.
 
         Args:
@@ -135,17 +145,16 @@ class NPUBuffer(DeviceBuffer):
         size = int(np.prod(final_alloc_shape))
         size_bytes = size * dtype.itemsize
 
-        zero_data = b"\x00" * size_bytes
-        mtl_buffer = device.mtl_device.newBufferWithBytes_length_options_(
-            zero_data, size_bytes, _STORAGE_MODE_SHARED
-        )
+        # Metal cannot allocate 0-byte buffers; use 1-byte placeholder
+        alloc_bytes = max(size_bytes, 1)
+        zero_data = b"\x00" * alloc_bytes
+        mtl_buffer = device.mtl_device.newBufferWithBytes_length_options_(zero_data, alloc_bytes, _STORAGE_MODE_SHARED)
         if mtl_buffer is None:
-            raise RuntimeError(f"Failed to allocate Metal buffer ({size_bytes} bytes)")
+            raise RuntimeError(f"Failed to allocate Metal buffer ({alloc_bytes} bytes)")
 
         return NPUBuffer(mtl_buffer, logical_shape, dtype, device, final_alloc_shape)
 
-    def to_numpy(self, dtype: np.dtype = np.dtype(np.float32),
-                 spec: TensorSpec | None = None) -> np.ndarray:
+    def to_numpy(self, dtype: np.dtype = np.dtype(np.float32), spec: TensorSpec | None = None) -> np.ndarray:
         """Read buffer contents back as numpy array. Default output is FP32.
 
         Args:
@@ -157,16 +166,26 @@ class NPUBuffer(DeviceBuffer):
             return _to_numpy_with_spec(self, spec)
 
         nbytes = self.size_bytes
+        if nbytes == 0:
+            return np.zeros(self._shape, dtype=dtype)
 
         mv = self._buffer.contents().as_buffer(nbytes)
-        result = np.frombuffer(mv, dtype=self._dtype).reshape(self._alloc_shape).copy()
+        flat = np.frombuffer(mv, dtype=self._dtype).copy()
 
-        # Strip padding if alloc_shape differs from logical shape
-        if self._alloc_shape != self._shape:
+        alloc_size = int(np.prod(self._alloc_shape))
+        logical_size = int(np.prod(self._shape))
+
+        if alloc_size == logical_size:
+            # No padding — reshape directly to logical shape
+            result = flat[:logical_size].reshape(self._shape)
+        elif len(self._alloc_shape) == len(self._shape):
+            # Same rank, different sizes — slice padding per dimension
+            result = flat.reshape(self._alloc_shape)
             slices = tuple(slice(0, s) for s in self._shape)
             result = result[slices]
-
-        result = result.reshape(self._shape)
+        else:
+            # Different ranks (e.g. compiler flattened dims) — take logical_size elements
+            result = flat[:logical_size].reshape(self._shape)
 
         if dtype != self._dtype:
             result = result.astype(dtype)
@@ -203,7 +222,9 @@ def _from_numpy_with_spec(data: np.ndarray, device: Device, spec: TensorSpec) ->
 
     raw_bytes = contiguous.tobytes()
     mtl_buffer = device.mtl_device.newBufferWithBytes_length_options_(
-        raw_bytes, len(raw_bytes), _STORAGE_MODE_SHARED,
+        raw_bytes,
+        len(raw_bytes),
+        _STORAGE_MODE_SHARED,
     )
     if mtl_buffer is None:
         raise RuntimeError(f"Failed to allocate Metal buffer ({len(raw_bytes)} bytes)")

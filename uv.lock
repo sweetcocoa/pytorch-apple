@@ -1043,7 +1043,7 @@ requires-dist = [
     { name = "pyobjc-framework-metal", specifier = ">=12.0" },
     { name = "pyobjc-framework-metalperformanceshaders", specifier = ">=12.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0" },
-    { name = "pytorch-ir" },
+    { name = "pytorch-ir", editable = "../torch_to_ir" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
     { name = "safetensors", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "safetensors", marker = "extra == 'examples'", specifier = ">=0.7" },
@@ -1544,15 +1544,27 @@ wheels = [
 
 [[package]]
 name = "pytorch-ir"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "../torch_to_ir" }
 dependencies = [
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/55/f9/338876de97a14b9f86410681b4e1eb50bfce4c6751332efa94c8e53726ce/pytorch_ir-0.2.0.tar.gz", hash = "sha256:ed04c4c598da0c205bb0e7f76f1336b73942b1822f734d912b188194f0d9c102", size = 161100, upload-time = "2026-02-09T15:07:21.125Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f2/ce/e6ccd2e05b47b9ac300b582f64366301c260301d8abd78650033c37e71a7/pytorch_ir-0.2.0-py3-none-any.whl", hash = "sha256:28d76feacd02296cbf6b8eea9052a80c0856c1a436e654a7ebeae1d707178c20", size = 30635, upload-time = "2026-02-09T15:07:20.032Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
+    { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
+    { name = "mkdocs-static-i18n", marker = "extra == 'docs'", specifier = ">=1.0" },
+    { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.27" },
+    { name = "mmdc", marker = "extra == 'rendering'", specifier = ">=0.4" },
+    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
+    { name = "safetensors", marker = "extra == 'safetensors'", specifier = ">=0.4" },
+    { name = "torch", specifier = ">=2.1" },
+    { name = "torchvision", marker = "extra == 'dev'", specifier = ">=0.16" },
+    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.15" },
 ]
+provides-extras = ["dev", "docs", "rendering", "safetensors"]
 
 [[package]]
 name = "pyyaml"
