@@ -23,8 +23,6 @@ Thumbs.db
 .ruff_cache/
 
 # Claude Code
-.claude/
-CLAUDE.md
 EVALUATION_CRITERIA.md
 
 # Model weights & large files
@@ -36,6 +34,8 @@ EVALUATION_CRITERIA.md
 
 # Benchmark results
 benchmarks/results/
+benchmarks/*.json
+benchmarks/*.png
 
 # MkDocs build
 site/
