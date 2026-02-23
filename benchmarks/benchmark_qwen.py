@@ -1,18 +1,26 @@
-"""Qwen2.5-1.5B benchmark: Metal GPU vs CPU across 6 scenarios.
+"""Qwen2.5-1.5B decode scaling benchmark: Executor vs DAGExecutor.
 
-Measures TTFT, TPS, prefill throughput, peak memory, compilation time,
-and weight loading time with 5-run median + stddev (3 warmup runs).
+Measures decode TPS at log-scale positions up to the model's
+max_position_embeddings (32768 tokens). At each position, a KV cache
+is filled with random data and a single decode step is timed.
+This avoids actually running thousands of decode steps.
+
+If existing IR files have a smaller max_cache_len than requested,
+the script will automatically re-extract IR with the correct size.
 
 Prerequisites:
-    1. Run extract_qwen_ir.py first to generate IR files.
-    2. pip install transformers huggingface_hub safetensors matplotlib
+    pip install transformers huggingface_hub safetensors matplotlib ml-dtypes
 
 Usage:
     cd examples/
     python ../benchmarks/benchmark_qwen.py
-    python ../benchmarks/benchmark_qwen.py --scenarios S1 S3 --runs 3
-    python ../benchmarks/benchmark_qwen.py --no-cpu  # skip CPU baseline
-    python ../benchmarks/benchmark_qwen.py --chart benchmark_chart.png
+    python ../benchmarks/benchmark_qwen.py --max-cache-len 4096  # smaller test
+    python ../benchmarks/benchmark_qwen.py --chart scaling_chart.png
+    python ../benchmarks/benchmark_qwen.py --mode executor  # executor only
+    python ../benchmarks/benchmark_qwen.py --mode dag       # dag only
+    python ../benchmarks/benchmark_qwen.py --repeats 5      # 5 measurements per point
+    python ../benchmarks/benchmark_qwen.py --mode both --chart-dir ../docs/assets/
+    python ../benchmarks/benchmark_qwen.py --comparison-chart comparison.png
 """
 
 from __future__ import annotations
@@ -33,60 +41,43 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-
-# Scenario definitions: (prompt_length, decode_length, description)
-SCENARIOS = {
-    "S1": (16, 32, "최소 부하 (오버헤드 비율)"),
-    "S2": (64, 64, "짧은 대화"),
-    "S3": (256, 128, "중간 대화"),
-    "S4": (512, 256, "긴 컨텍스트"),
-    "S5": (1024, 128, "긴 문서 요약 (prefill 중심)"),
-    "S6": (64, 512, "짧은 질문 + 긴 응답 (decode 중심)"),
-}
+MODEL_MAX_POSITION_EMBEDDINGS = 32768  # Qwen2.5-1.5B-Instruct architectural max
+PROMPT_LENGTH = 64
 
 
-@dataclass
-class RunMetrics:
-    """Metrics from a single benchmark run."""
-    ttft_ms: float = 0.0          # time to first token (prefill)
-    tps: float = 0.0              # tokens per second (decode, excluding first token)
-    prefill_tps: float = 0.0      # prompt tokens / prefill time
-    decode_tokens: int = 0        # actual decode tokens generated
-    per_step_tps: list[float] = field(default_factory=list)  # TPS at each decode step
+def _log_scale_steps(max_steps: int) -> list[int]:
+    """Generate log-scale positions: 1, 2, 4, ..., up to max_steps."""
+    steps = []
+    v = 1
+    while v < max_steps:
+        steps.append(v)
+        v *= 2
+    steps.append(max_steps)
+    return steps
 
 
 @dataclass
-class ScenarioResult:
-    """Aggregated results for one scenario."""
-    scenario_id: str
-    prompt_length: int
-    decode_length: int
-    description: str
-    # 5-run stats (median ± stddev)
-    ttft_median_ms: float = 0.0
-    ttft_std_ms: float = 0.0
-    tps_median: float = 0.0
-    tps_std: float = 0.0
-    prefill_tps_median: float = 0.0
-    prefill_tps_std: float = 0.0
-    actual_decode_tokens: int = 0
-    step_tps_median: list[float] = field(default_factory=list)  # per-step TPS (median across runs)
+class ScalingPoint:
+    """Benchmark result for a single decode position."""
+
+    position: int  # KV cache fill level (decode step number)
+    step_time_ms: float = 0.0  # median single-step decode time
+    step_time_std_ms: float = 0.0
+    tps: float = 0.0  # 1000 / step_time_ms
+    ttft_ms: float = 0.0  # prefill time (constant across positions)
 
 
 @dataclass
-class BenchmarkReport:
-    """Full benchmark report."""
+class ScalingReport:
+    """Full scaling benchmark report."""
+
     environment: dict = field(default_factory=dict)
     compile_time_sec: float = 0.0
     weight_load_time_sec: float = 0.0
-    peak_memory_mb: float = 0.0
-    npu_results: list[ScenarioResult] = field(default_factory=list)
-    cpu_results: list[ScenarioResult] = field(default_factory=list)
-    # Analysis metrics
-    prefill_scaling_ms_per_token: float = 0.0   # TTFT increase per prompt token
-    decode_tps_cv_percent: float = 0.0          # TPS coefficient of variation across scenarios
-    gpu_utilization_percent: float = 0.0        # kernel_time / total_time estimate
-    kernel_launch_overhead_us: float = 0.0      # per-kernel average overhead (microseconds)
+    prompt_length: int = PROMPT_LENGTH
+    max_cache_len: int = 0
+    executor_results: list[ScalingPoint] = field(default_factory=list)
+    dag_results: list[ScalingPoint] = field(default_factory=list)
 
 
 def get_environment_info() -> dict:
@@ -97,194 +88,86 @@ def get_environment_info() -> dict:
         "python": platform.python_version(),
         "macos": platform.mac_ver()[0],
     }
-
-    # Chipset via sysctl
     try:
-        chip = subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        info["chipset"] = chip
+        chip_name = subprocess.check_output(["sysctl", "-n", "hw.chip"], text=True, stderr=subprocess.DEVNULL).strip()
+        info["chipset"] = chip_name
     except Exception:
-        info["chipset"] = "unknown"
-
-    # Apple Silicon chip name
+        try:
+            chip = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            info["chipset"] = chip
+        except Exception:
+            info["chipset"] = "unknown"
     try:
-        chip_name = subprocess.check_output(
-            ["sysctl", "-n", "hw.chip"],
-            text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        if chip_name:
-            info["chipset"] = chip_name
-    except Exception:
-        pass
-
-    # RAM
-    try:
-        mem_bytes = int(subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"],
-            text=True, stderr=subprocess.DEVNULL
-        ).strip())
-        info["ram_gb"] = mem_bytes / (1024 ** 3)
+        mem_bytes = int(
+            subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+        info["ram_gb"] = mem_bytes / (1024**3)
     except Exception:
         info["ram_gb"] = 0
-
-    # Metal GPU Family
     try:
         from npu_runtime.device import Device
+
         dev = Device()
-        gpu_name = str(dev.device.name())
-        info["metal_gpu"] = gpu_name
+        info["metal_gpu"] = str(dev.device.name())
     except Exception:
         info["metal_gpu"] = "unknown"
-
     return info
 
 
-def _build_prompt_tokens(tokenizer, prompt_length: int) -> np.ndarray:
-    """Generate token IDs of approximately the target length."""
-    # Repeat a simple sentence to reach target length
-    base = "The quick brown fox jumps over the lazy dog. "
-    text = base * (prompt_length // 8 + 1)
-    ids = tokenizer.encode(text, return_tensors="np")[0]
-    if len(ids) >= prompt_length:
-        return ids[:prompt_length]
-    # Pad with repeated tokens if text encoding was shorter than expected
-    while len(ids) < prompt_length:
-        ids = np.concatenate([ids, ids])
-    return ids[:prompt_length]
+def _get_ir_max_cache_len(kv_mapping_path: str) -> int | None:
+    """Read max_cache_len from existing KV mapping file."""
+    try:
+        with open(kv_mapping_path) as f:
+            return json.load(f).get("max_cache_len")
+    except FileNotFoundError:
+        return None
+
+
+def _extract_ir_if_needed(
+    prefill_ir_path: str,
+    decode_ir_path: str,
+    kv_mapping_path: str,
+    needed_max_cache_len: int,
+    prefill_seq_len: int = 128,
+) -> None:
+    """Re-extract IR files if they don't exist or have a smaller max_cache_len than needed."""
+    current = _get_ir_max_cache_len(kv_mapping_path)
+    if current is not None and current >= needed_max_cache_len:
+        print(f"  Existing IR has max_cache_len={current} (>= {needed_max_cache_len}), reusing.")
+        return
+
+    print(f"  Extracting IR with max_cache_len={needed_max_cache_len} (current={current})...")
+    extract_script = os.path.join(os.path.dirname(__file__), "..", "examples", "extract_qwen_ir.py")
+    cmd = [
+        sys.executable,
+        extract_script,
+        "--max-cache-len",
+        str(needed_max_cache_len),
+        "--prefill-seq-len",
+        str(prefill_seq_len),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  IR extraction failed:\n{result.stderr}")
+        raise RuntimeError("IR extraction failed")
+    print("  IR extraction complete.")
 
 
 # ---------------------------------------------------------------------------
-# NPU benchmark
+# Executor benchmark — single-step at each position
 # ---------------------------------------------------------------------------
 
-def _npu_prefill(prefill_executor, prefill_program, prefill_weights, input_ids, device):
-    """Run NPU prefill and return (outputs, prefill_time_sec, next_token)."""
-    from npu_runtime.buffer import NPUBuffer
 
-    prefill_seq_len = prefill_program.input_specs[0].shape[1]
-    padded_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
-    actual_len = min(len(input_ids), prefill_seq_len)
-    padded_ids[0, :actual_len] = input_ids[:actual_len]
-
-    _NEG_INF = np.float16(-np.inf)
-    causal_mask = np.triu(
-        np.full((1, 1, prefill_seq_len, prefill_seq_len), _NEG_INF, dtype=np.float16), k=1
-    )
-    causal_mask[:, :, :, actual_len:] = _NEG_INF
-    causal_mask[:, :, actual_len:, :] = _NEG_INF
-    position_ids = np.arange(prefill_seq_len, dtype=np.int64).reshape(1, -1)
-    cache_position = np.arange(prefill_seq_len, dtype=np.int64)
-
-    np_map = {
-        "input_ids": padded_ids, "attention_mask": causal_mask,
-        "position_ids": position_ids, "cache_position": cache_position,
-    }
-    inputs = {
-        spec.name: NPUBuffer.from_numpy(np_map[spec.name], device, spec=spec)
-        for spec in prefill_program.input_specs
-    }
-
-    t0 = time.perf_counter()
-    outputs = prefill_executor.run(inputs=inputs, weights=prefill_weights)
-    prefill_time = time.perf_counter() - t0
-
-    logits_name = prefill_program.output_specs[0].name
-    logits = outputs[logits_name].to_numpy(spec=prefill_program.output_specs[0])
-    next_token = int(np.argmax(logits[0, actual_len - 1, :]))
-
-    return outputs, prefill_time, next_token, actual_len
-
-
-def _npu_decode_loop(
-    decode_executor, decode_program, decode_weights, prefill_outputs,
-    prefill_program, kv_map, next_token, actual_len, max_tokens, device, tokenizer,
-):
-    """Run NPU decode loop. Returns (tokens_generated, decode_time_sec, step_times_ms)."""
-    from npu_runtime.buffer import NPUBuffer
-
-    prefill_seq_len = prefill_program.input_specs[0].shape[1]
-    first_kv_name = kv_map["layers"][0]["decode_key_input"]
-    max_cache_len = next(
-        s.shape[2] for s in decode_program.input_specs if s.name == first_kv_name
-    )
-    _NEG_INF = np.float16(-np.inf)
-
-    _FIXED_INPUTS = {"input_ids", "attention_mask", "position_ids", "cache_position"}
-    decode_kv_specs = {
-        s.name: s for s in decode_program.input_specs if s.name not in _FIXED_INPUTS
-    }
-
-    kv_buffers = {}
-    for layer in kv_map["layers"]:
-        for pkey, dkey in [(layer["prefill_key_output"], layer["decode_key_input"]),
-                           (layer["prefill_value_output"], layer["decode_value_input"])]:
-            prefill_kv = prefill_outputs[pkey]
-            decode_spec = decode_kv_specs[dkey]
-            prefill_spec = next(s for s in prefill_program.output_specs if s.name == pkey)
-            kv_np = prefill_kv.to_numpy(spec=prefill_spec)
-            padded_kv = np.zeros(decode_spec.shape, dtype=kv_np.dtype)
-            padded_kv[:, :, :prefill_seq_len, :] = kv_np
-            kv_buffers[dkey] = NPUBuffer.from_numpy(padded_kv, device, spec=decode_spec)
-
-    generated = [next_token]
-    step_times_ms: list[float] = []
-    t0 = time.perf_counter()
-
-    for step in range(max_tokens - 1):
-        step_t0 = time.perf_counter()
-        cur_pos = actual_len + step
-        token_arr = np.array([[next_token]], dtype=np.int64)
-        decode_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
-        decode_mask[0, 0, 0, :cur_pos + 1] = 0.0
-
-        np_map = {
-            "input_ids": token_arr,
-            "attention_mask": decode_mask,
-            "position_ids": np.array([[cur_pos]], dtype=np.int64),
-            "cache_position": np.array([cur_pos], dtype=np.int64),
-        }
-
-        decode_inputs = {}
-        for spec in decode_program.input_specs:
-            if spec.name in np_map:
-                decode_inputs[spec.name] = NPUBuffer.from_numpy(
-                    np_map[spec.name], device, spec=spec
-                )
-            elif spec.name in kv_buffers:
-                decode_inputs[spec.name] = kv_buffers[spec.name]
-
-        decode_outputs = decode_executor.run(
-            inputs=decode_inputs, weights=decode_weights
-        )
-
-        dec_logits_name = decode_program.output_specs[0].name
-        dec_logits = decode_outputs[dec_logits_name].to_numpy(
-            spec=decode_program.output_specs[0]
-        )
-        next_token = int(np.argmax(dec_logits[0, -1, :]))
-
-        step_elapsed = (time.perf_counter() - step_t0) * 1000  # ms
-        step_times_ms.append(step_elapsed)
-
-        if next_token == tokenizer.eos_token_id:
-            break
-        generated.append(next_token)
-
-        for layer in kv_map["layers"]:
-            kv_buffers[layer["decode_key_input"]] = decode_outputs[layer["decode_key_output"]]
-            kv_buffers[layer["decode_value_input"]] = decode_outputs[layer["decode_value_output"]]
-
-    decode_time = time.perf_counter() - t0
-    return generated, decode_time, step_times_ms
-
-
-def benchmark_npu_scenario(
-    scenario_id: str,
-    prompt_length: int,
-    decode_length: int,
-    description: str,
+def benchmark_executor_scaling(
+    positions: list[int],
     prefill_executor,
     decode_executor,
     prefill_program,
@@ -293,544 +176,533 @@ def benchmark_npu_scenario(
     decode_weights,
     kv_map,
     device,
-    tokenizer,
-    warmup: int = 3,
-    runs: int = 5,
-) -> ScenarioResult:
-    """Benchmark one scenario on NPU with warmup + multiple runs."""
-    input_ids = _build_prompt_tokens(tokenizer, prompt_length)
-    actual_prompt_len = min(len(input_ids), prefill_program.input_specs[0].shape[1])
+    input_ids: np.ndarray,
+    repeats: int = 3,
+) -> tuple[list[ScalingPoint], float]:
+    """Measure single-step decode time at each cache position.
 
-    all_metrics: list[RunMetrics] = []
-
-    for i in range(warmup + runs):
-        outputs, prefill_time, next_token, actual_len = _npu_prefill(
-            prefill_executor, prefill_program, prefill_weights, input_ids, device
-        )
-
-        generated, decode_time, step_times_ms = _npu_decode_loop(
-            decode_executor, decode_program, decode_weights, outputs,
-            prefill_program, kv_map, next_token, actual_len, decode_length,
-            device, tokenizer,
-        )
-
-        # Skip warmup runs
-        if i < warmup:
-            continue
-
-        # Per-step TPS: 1 token / step_time_sec
-        per_step_tps = [1000.0 / t for t in step_times_ms if t > 0]
-
-        m = RunMetrics(
-            ttft_ms=prefill_time * 1000,
-            tps=len(generated) / decode_time if decode_time > 0 else 0,
-            prefill_tps=actual_prompt_len / prefill_time if prefill_time > 0 else 0,
-            decode_tokens=len(generated),
-            per_step_tps=per_step_tps,
-        )
-        all_metrics.append(m)
-
-    ttfts = [m.ttft_ms for m in all_metrics]
-    tps_vals = [m.tps for m in all_metrics]
-    prefill_vals = [m.prefill_tps for m in all_metrics]
-
-    # Compute per-step TPS median across runs (align by step index)
-    max_steps = max(len(m.per_step_tps) for m in all_metrics) if all_metrics else 0
-    step_tps_median = []
-    for step_idx in range(max_steps):
-        vals = [m.per_step_tps[step_idx] for m in all_metrics if step_idx < len(m.per_step_tps)]
-        step_tps_median.append(float(np.median(vals)))
-
-    return ScenarioResult(
-        scenario_id=scenario_id,
-        prompt_length=prompt_length,
-        decode_length=decode_length,
-        description=description,
-        ttft_median_ms=float(np.median(ttfts)),
-        ttft_std_ms=float(np.std(ttfts)),
-        tps_median=float(np.median(tps_vals)),
-        tps_std=float(np.std(tps_vals)),
-        prefill_tps_median=float(np.median(prefill_vals)),
-        prefill_tps_std=float(np.std(prefill_vals)),
-        actual_decode_tokens=all_metrics[-1].decode_tokens,
-        step_tps_median=step_tps_median,
-    )
-
-
-# ---------------------------------------------------------------------------
-# CPU baseline
-# ---------------------------------------------------------------------------
-
-def benchmark_cpu_scenario(
-    scenario_id: str,
-    prompt_length: int,
-    decode_length: int,
-    description: str,
-    model,
-    tokenizer,
-    warmup: int = 3,
-    runs: int = 5,
-) -> ScenarioResult:
-    """Benchmark one scenario on CPU via transformers generate()."""
-    import torch
-
-    input_ids = _build_prompt_tokens(tokenizer, prompt_length)
-    input_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)  # (1, seq)
-
-    all_metrics: list[RunMetrics] = []
-
-    for i in range(warmup + runs):
-        # Prefill: forward pass on full prompt
-        with torch.no_grad():
-            t0 = time.perf_counter()
-            outputs = model(input_tensor, use_cache=True)
-            prefill_time = time.perf_counter() - t0
-
-        next_token = int(torch.argmax(outputs.logits[0, -1, :]))
-        past = outputs.past_key_values
-
-        # Decode loop
-        generated = [next_token]
-        t0 = time.perf_counter()
-        for _ in range(decode_length - 1):
-            with torch.no_grad():
-                tok = torch.tensor([[next_token]], dtype=torch.long)
-                outputs = model(tok, past_key_values=past, use_cache=True)
-            past = outputs.past_key_values
-            next_token = int(torch.argmax(outputs.logits[0, -1, :]))
-            if next_token == tokenizer.eos_token_id:
-                break
-            generated.append(next_token)
-        decode_time = time.perf_counter() - t0
-
-        if i < warmup:
-            continue
-
-        m = RunMetrics(
-            ttft_ms=prefill_time * 1000,
-            tps=len(generated) / decode_time if decode_time > 0 else 0,
-            prefill_tps=prompt_length / prefill_time if prefill_time > 0 else 0,
-            decode_tokens=len(generated),
-        )
-        all_metrics.append(m)
-
-    ttfts = [m.ttft_ms for m in all_metrics]
-    tps_vals = [m.tps for m in all_metrics]
-    prefill_vals = [m.prefill_tps for m in all_metrics]
-
-    return ScenarioResult(
-        scenario_id=scenario_id,
-        prompt_length=prompt_length,
-        decode_length=decode_length,
-        description=description,
-        ttft_median_ms=float(np.median(ttfts)),
-        ttft_std_ms=float(np.std(ttfts)),
-        tps_median=float(np.median(tps_vals)),
-        tps_std=float(np.std(tps_vals)),
-        prefill_tps_median=float(np.median(prefill_vals)),
-        prefill_tps_std=float(np.std(prefill_vals)),
-        actual_decode_tokens=all_metrics[-1].decode_tokens,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Peak memory estimation
-# ---------------------------------------------------------------------------
-
-def estimate_peak_memory_mb(prefill_program, decode_program) -> float:
-    """Estimate peak GPU buffer allocation in MB.
-
-    Sums weight buffers + intermediate buffers from compiled programs.
-    """
-    total_bytes = 0
-
-    # Weight buffers (shared between prefill and decode)
-    seen_weights = set()
-    for prog in (prefill_program, decode_program):
-        for spec in prog.weight_specs:
-            if spec.name not in seen_weights:
-                seen_weights.add(spec.name)
-                elem_size = 2  # fp16/bf16
-                n_elements = 1
-                for d in spec.shape:
-                    n_elements *= d
-                total_bytes += n_elements * elem_size
-
-    # Intermediate buffers (from execution plan)
-    for prog in (prefill_program, decode_program):
-        for alloc in prog.execution_plan.buffer_allocations:
-            elem_size = 2
-            n_elements = 1
-            for d in alloc.shape:
-                n_elements *= d
-            total_bytes += n_elements * elem_size
-
-    return total_bytes / (1024 * 1024)
-
-
-# ---------------------------------------------------------------------------
-# Analysis metrics
-# ---------------------------------------------------------------------------
-
-def compute_prefill_scaling(results: list[ScenarioResult]) -> float:
-    """Compute TTFT scaling rate (ms per token) via linear regression.
-
-    Ideal: linear scaling where TTFT grows proportionally to prompt length.
-    Returns the slope of the best-fit line (ms per additional prompt token).
-    """
-    if len(results) < 2:
-        return 0.0
-    # Use only scenarios with distinct prompt lengths
-    seen = {}
-    for r in results:
-        if r.prompt_length not in seen:
-            seen[r.prompt_length] = r.ttft_median_ms
-    if len(seen) < 2:
-        return 0.0
-    x = np.array(list(seen.keys()), dtype=np.float64)
-    y = np.array(list(seen.values()), dtype=np.float64)
-    # Linear regression: y = mx + b
-    m, _ = np.polyfit(x, y, 1)
-    return float(m)
-
-
-def compute_decode_scaling_cv(results: list[ScenarioResult]) -> float:
-    """Compute TPS coefficient of variation across decode lengths.
-
-    Ideal: TPS remains constant regardless of decode length (CV ≈ 0%).
-    High CV indicates TPS degrades for longer generations.
-    """
-    tps_vals = [r.tps_median for r in results if r.tps_median > 0]
-    if len(tps_vals) < 2:
-        return 0.0
-    mean = np.mean(tps_vals)
-    std = np.std(tps_vals)
-    return float(std / mean * 100) if mean > 0 else 0.0
-
-
-def estimate_gpu_utilization(
-    decode_executor, decode_program, decode_weights, device, kv_map,
-    prefill_outputs, prefill_program, actual_len, next_token, tokenizer,
-) -> tuple[float, float]:
-    """Estimate GPU utilization and per-kernel launch overhead.
-
-    Method: Run decode step with full kernel count, then measure total time.
-    GPU utilization = 1 - (overhead / total_time) where overhead is estimated
-    from the difference between actual total time and ideal kernel-only time.
-    Per-kernel overhead = (total_time - kernel_time_estimate) / kernel_count.
-
-    Returns (gpu_utilization_percent, per_kernel_overhead_us).
+    Returns (results, ttft_ms).
     """
     from npu_runtime.buffer import NPUBuffer
 
     prefill_seq_len = prefill_program.input_specs[0].shape[1]
     first_kv_name = kv_map["layers"][0]["decode_key_input"]
-    max_cache_len = next(
-        s.shape[2] for s in decode_program.input_specs if s.name == first_kv_name
-    )
+    max_cache_len = next(s.shape[2] for s in decode_program.input_specs if s.name == first_kv_name)
     _NEG_INF = np.float16(-np.inf)
     _FIXED_INPUTS = {"input_ids", "attention_mask", "position_ids", "cache_position"}
-    decode_kv_specs = {
-        s.name: s for s in decode_program.input_specs if s.name not in _FIXED_INPUTS
-    }
+    decode_kv_specs = {s.name: s for s in decode_program.input_specs if s.name not in _FIXED_INPUTS}
 
-    # Prepare KV buffers
-    kv_buffers = {}
-    for layer in kv_map["layers"]:
-        for pkey, dkey in [(layer["prefill_key_output"], layer["decode_key_input"]),
-                           (layer["prefill_value_output"], layer["decode_value_input"])]:
-            prefill_kv = prefill_outputs[pkey]
-            decode_spec = decode_kv_specs[dkey]
-            prefill_spec = next(s for s in prefill_program.output_specs if s.name == pkey)
-            kv_np = prefill_kv.to_numpy(spec=prefill_spec)
-            padded_kv = np.zeros(decode_spec.shape, dtype=kv_np.dtype)
-            padded_kv[:, :, :prefill_seq_len, :] = kv_np
-            kv_buffers[dkey] = NPUBuffer.from_numpy(padded_kv, device, spec=decode_spec)
+    # Prefill (for TTFT measurement)
+    actual_len = min(len(input_ids), prefill_seq_len)
+    padded_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
+    padded_ids[0, :actual_len] = input_ids[:actual_len]
 
-    # Prepare one decode step
-    cur_pos = actual_len
+    causal_mask = np.triu(
+        np.full((1, 1, prefill_seq_len, prefill_seq_len), _NEG_INF, dtype=np.float16),
+        k=1,
+    )
+    causal_mask[:, :, :, actual_len:] = _NEG_INF
+    causal_mask[:, :, actual_len:, :] = _NEG_INF
+
     np_map = {
-        "input_ids": np.array([[next_token]], dtype=np.int64),
-        "attention_mask": np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16),
-        "position_ids": np.array([[cur_pos]], dtype=np.int64),
-        "cache_position": np.array([cur_pos], dtype=np.int64),
+        "input_ids": padded_ids,
+        "attention_mask": causal_mask,
+        "position_ids": np.arange(prefill_seq_len, dtype=np.int64).reshape(1, -1),
+        "cache_position": np.arange(prefill_seq_len, dtype=np.int64),
     }
-    np_map["attention_mask"][0, 0, 0, :cur_pos + 1] = 0.0
+    prefill_inputs = {
+        spec.name: NPUBuffer.from_numpy(np_map[spec.name], device, spec=spec) for spec in prefill_program.input_specs
+    }
 
-    decode_inputs = {}
-    for spec in decode_program.input_specs:
-        if spec.name in np_map:
-            decode_inputs[spec.name] = NPUBuffer.from_numpy(np_map[spec.name], device, spec=spec)
-        elif spec.name in kv_buffers:
-            decode_inputs[spec.name] = kv_buffers[spec.name]
+    t0 = time.perf_counter()
+    prefill_executor.run(inputs=prefill_inputs, weights=prefill_weights)
+    ttft_ms = (time.perf_counter() - t0) * 1000
 
-    kernel_count = len(decode_program.kernel_calls)
+    # For each position, create random KV cache and time one decode step
+    results = []
+    for pos in positions:
+        # Create random KV cache buffers (simulating pos tokens already decoded)
+        kv_buffers = {}
+        for layer in kv_map["layers"]:
+            for dkey in [layer["decode_key_input"], layer["decode_value_input"]]:
+                spec = decode_kv_specs[dkey]
+                # Random data in the KV cache shape
+                kv_data = np.random.randn(*spec.shape).astype(np.float16)
+                kv_buffers[dkey] = NPUBuffer.from_numpy(kv_data, device, spec=spec)
 
-    # Warmup
-    for _ in range(5):
-        decode_executor.run(inputs=decode_inputs, weights=decode_weights)
+        # Prepare decode inputs at this position
+        cur_pos = prefill_seq_len + pos - 1  # 0-indexed position in cache
+        token_arr = np.array([[1]], dtype=np.int64)  # dummy token
+        decode_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
+        decode_mask[0, 0, 0, : cur_pos + 1] = 0.0
 
-    # Measure 20 iterations for stable timing
-    times = []
-    for _ in range(20):
-        t0 = time.perf_counter()
-        decode_executor.run(inputs=decode_inputs, weights=decode_weights)
-        times.append(time.perf_counter() - t0)
+        step_np_map = {
+            "input_ids": token_arr,
+            "attention_mask": decode_mask,
+            "position_ids": np.array([[cur_pos]], dtype=np.int64),
+            "cache_position": np.array([cur_pos], dtype=np.int64),
+        }
 
-    median_time = float(np.median(times))
-    # Estimate: GPU utilization is high when all time is spent in kernels.
-    # Overhead per kernel ≈ total_time / kernel_count - kernel_compute_time / kernel_count.
-    # Without per-kernel GPU timestamps, we estimate overhead from the
-    # ratio of Metal command buffer submission overhead to total time.
-    # Empirically, Metal command buffer overhead is ~2-5μs per kernel dispatch.
-    # We report actual per-kernel time = total_time / kernel_count.
-    per_kernel_us = median_time * 1e6 / kernel_count if kernel_count > 0 else 0
+        decode_inputs = {}
+        for spec in decode_program.input_specs:
+            if spec.name in step_np_map:
+                decode_inputs[spec.name] = NPUBuffer.from_numpy(step_np_map[spec.name], device, spec=spec)
+            elif spec.name in kv_buffers:
+                decode_inputs[spec.name] = kv_buffers[spec.name]
 
-    # GPU utilization: approximate as (1 - python_overhead / total_time).
-    # Python overhead is ~1-3μs per kernel for buffer binding + dispatch call.
-    # Measured by comparing back-to-back immediate runs.
-    ESTIMATED_PYTHON_OVERHEAD_US = 2.0  # conservative estimate per dispatch
-    estimated_overhead = ESTIMATED_PYTHON_OVERHEAD_US * kernel_count * 1e-6
-    gpu_util = max(0, (1 - estimated_overhead / median_time) * 100) if median_time > 0 else 0
+        # Measure
+        times_ms = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            decode_executor.run(inputs=decode_inputs, weights=decode_weights)
+            times_ms.append((time.perf_counter() - t0) * 1000)
 
-    return float(gpu_util), float(per_kernel_us)
+        median_ms = float(np.median(times_ms))
+        std_ms = float(np.std(times_ms))
+        tps = 1000.0 / median_ms if median_ms > 0 else 0
+
+        pt = ScalingPoint(
+            position=pos,
+            step_time_ms=median_ms,
+            step_time_std_ms=std_ms,
+            tps=tps,
+            ttft_ms=ttft_ms,
+        )
+        results.append(pt)
+        print(f"    pos={pos:>6}: {median_ms:.1f}ms (TPS={tps:.1f})")
+
+    return results, ttft_ms
+
+
+# ---------------------------------------------------------------------------
+# DAGExecutor benchmark — single-step at each position
+# ---------------------------------------------------------------------------
+
+
+def benchmark_dag_scaling(
+    positions: list[int],
+    prefill_ir_path: str,
+    decode_ir_path: str,
+    kv_mapping_path: str,
+    model_id: str,
+    input_ids: np.ndarray,
+    repeats: int = 3,
+) -> tuple[list[ScalingPoint], float]:
+    """Measure single-step DAG decode time at each cache position.
+
+    Uses DeviceBuffer inputs (same as Executor benchmark) to measure
+    pure execution time without numpy→GPU upload overhead.
+    """
+    import ml_dtypes  # noqa: F401
+
+    from npu_compiler.op_support import is_op_supported
+    from npu_compiler.partitioner import partition
+    from npu_runtime.buffer import NPUBuffer
+    from npu_runtime.dag_executor import DAGExecutor
+    from npu_runtime.metal_backend import MetalBackend
+
+    with open(prefill_ir_path) as f:
+        prefill_ir_dict = json.load(f)
+    with open(decode_ir_path) as f:
+        decode_ir_dict = json.load(f)
+    with open(kv_mapping_path) as f:
+        kv_map = json.load(f)
+
+    backend = MetalBackend()
+    device = backend.device
+    prefill_plan = partition(prefill_ir_dict, is_op_supported)
+    decode_plan = partition(decode_ir_dict, is_op_supported)
+
+    prefill_dag = DAGExecutor(prefill_plan, backend)
+    decode_dag = DAGExecutor(decode_plan, backend)
+
+    from run_qwen_graph import load_numpy_weights
+
+    prefill_weights_np = load_numpy_weights(model_id, prefill_ir_dict)
+    decode_weights_np = load_numpy_weights(model_id, decode_ir_dict)
+
+    prefill_dag.load_weights(prefill_weights_np)
+    decode_dag.load_weights(decode_weights_np)
+
+    prefill_seq_len = prefill_ir_dict["graph_inputs"][0]["shape"][1]
+    first_kv_name = kv_map["layers"][0]["decode_key_input"]
+    max_cache_len = None
+    for gi in decode_ir_dict["graph_inputs"]:
+        if gi["name"] == first_kv_name:
+            max_cache_len = gi["shape"][2]
+            break
+
+    _NEG_INF = np.float16(-np.inf)
+    _FIXED_INPUTS = {"input_ids", "attention_mask", "position_ids", "cache_position"}
+
+    # Build decode input spec lookup for alloc_shape
+    decode_input_specs = {s.name: s for s in decode_dag.npu_programs[0].input_specs}
+
+    # Prefill (for TTFT)
+    actual_len = min(len(input_ids), prefill_seq_len)
+    padded_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
+    padded_ids[0, :actual_len] = input_ids[:actual_len]
+
+    causal_mask = np.triu(
+        np.full((1, 1, prefill_seq_len, prefill_seq_len), _NEG_INF, dtype=np.float16),
+        k=1,
+    )
+    causal_mask[:, :, :, actual_len:] = _NEG_INF
+    causal_mask[:, :, actual_len:, :] = _NEG_INF
+
+    prefill_inputs = {
+        "input_ids": padded_ids,
+        "attention_mask": causal_mask,
+        "position_ids": np.arange(prefill_seq_len, dtype=np.int64).reshape(1, -1),
+        "cache_position": np.arange(prefill_seq_len, dtype=np.int64),
+    }
+
+    t0 = time.perf_counter()
+    prefill_dag.execute(inputs=prefill_inputs)
+    ttft_ms = (time.perf_counter() - t0) * 1000
+
+    # Build decode KV input shapes
+    decode_kv_shapes = {}
+    for gi in decode_ir_dict["graph_inputs"]:
+        if gi["name"] not in _FIXED_INPUTS:
+            decode_kv_shapes[gi["name"]] = gi["shape"]
+
+    # For each position, time one decode step with random KV cache
+    results = []
+    for pos in positions:
+        cur_pos = prefill_seq_len + pos - 1
+
+        # Create KV cache as DeviceBuffer (same as Executor benchmark)
+        kv_buffers: dict[str, NPUBuffer] = {}
+        for layer in kv_map["layers"]:
+            for dkey in [layer["decode_key_input"], layer["decode_value_input"]]:
+                shape = decode_kv_shapes[dkey]
+                kv_data = np.random.randn(*shape).astype(np.float16)
+                spec = decode_input_specs.get(dkey)
+                kv_buffers[dkey] = NPUBuffer.from_numpy(kv_data, device, spec=spec)
+
+        decode_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
+        decode_mask[0, 0, 0, : cur_pos + 1] = 0.0
+
+        # Build inputs as DeviceBuffer
+        step_np_map = {
+            "input_ids": np.array([[1]], dtype=np.int64),
+            "attention_mask": decode_mask,
+            "position_ids": np.array([[cur_pos]], dtype=np.int64),
+            "cache_position": np.array([cur_pos], dtype=np.int64),
+        }
+
+        decode_inputs: dict[str, NPUBuffer] = {}
+        for name, arr in step_np_map.items():
+            spec = decode_input_specs.get(name)
+            decode_inputs[name] = NPUBuffer.from_numpy(arr, device, spec=spec)
+        decode_inputs.update(kv_buffers)
+
+        times_ms = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            decode_dag.execute(inputs=decode_inputs)
+            times_ms.append((time.perf_counter() - t0) * 1000)
+
+        median_ms = float(np.median(times_ms))
+        std_ms = float(np.std(times_ms))
+        tps = 1000.0 / median_ms if median_ms > 0 else 0
+
+        pt = ScalingPoint(
+            position=pos,
+            step_time_ms=median_ms,
+            step_time_std_ms=std_ms,
+            tps=tps,
+            ttft_ms=ttft_ms,
+        )
+        results.append(pt)
+        print(f"    pos={pos:>6}: {median_ms:.1f}ms (TPS={tps:.1f})")
+
+    return results, ttft_ms
 
 
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_report(report: BenchmarkReport, include_cpu: bool = True):
-    """Print formatted benchmark report to stdout."""
+
+def print_report(report: ScalingReport):
+    """Print formatted scaling benchmark report."""
     env = report.environment
 
     print("\n" + "=" * 80)
-    print("Qwen2.5-1.5B Benchmark Report")
+    print("Qwen2.5-1.5B Decode Scaling Benchmark")
     print("=" * 80)
 
-    print(f"\n{'Environment':}")
+    print(f"\nEnvironment:")
     print(f"  Chipset:    {env.get('chipset', 'N/A')}")
     print(f"  RAM:        {env.get('ram_gb', 0):.0f} GB")
-    print(f"  macOS:      {env.get('macos', 'N/A')}")
     print(f"  Metal GPU:  {env.get('metal_gpu', 'N/A')}")
-    print(f"  Python:     {env.get('python', 'N/A')}")
-    print(f"  Platform:   {env.get('platform', 'N/A')}")
 
-    print(f"\n{'Compilation & Loading':}")
-    print(f"  Compile time:      {report.compile_time_sec:.2f} sec")
-    print(f"  Weight load time:  {report.weight_load_time_sec:.2f} sec")
-    print(f"  Peak memory (est): {report.peak_memory_mb:.1f} MB")
+    print(f"\nConfiguration:")
+    print(f"  Prompt length:    {report.prompt_length} tokens")
+    print(f"  Max cache length: {report.max_cache_len} tokens")
+    print(f"  Compile time:     {report.compile_time_sec:.2f} sec")
+    print(f"  Weight load time: {report.weight_load_time_sec:.2f} sec")
 
-    print(f"\n{'Analysis Metrics':}")
-    print(f"  Prefill scaling:         {report.prefill_scaling_ms_per_token:.3f} ms/token "
-          f"(ideal: linear)")
-    print(f"  Decode TPS variation:    {report.decode_tps_cv_percent:.1f}% CV "
-          f"(ideal: ~0%, constant TPS)")
-    print(f"  GPU utilization (est):   {report.gpu_utilization_percent:.1f}%")
-    print(f"  Kernel launch overhead:  {report.kernel_launch_overhead_us:.1f} μs/kernel")
-
-    # NPU results table
-    print(f"\n{'NPU (Metal GPU) Results':}")
-    print(f"  {'ID':<4} {'Prompt':>6} {'Decode':>6} {'TTFT(ms)':>14} "
-          f"{'TPS':>14} {'PrefillTPS':>16} {'Description'}")
-    print("  " + "-" * 78)
-    for r in report.npu_results:
-        print(f"  {r.scenario_id:<4} {r.prompt_length:>6} {r.decode_length:>6} "
-              f"{r.ttft_median_ms:>7.1f}±{r.ttft_std_ms:<5.1f} "
-              f"{r.tps_median:>7.1f}±{r.tps_std:<5.1f} "
-              f"{r.prefill_tps_median:>8.0f}±{r.prefill_tps_std:<6.0f} "
-              f"{r.description}")
-
-    if include_cpu and report.cpu_results:
-        print(f"\n{'CPU Baseline Results':}")
-        print(f"  {'ID':<4} {'Prompt':>6} {'Decode':>6} {'TTFT(ms)':>14} "
-              f"{'TPS':>14} {'PrefillTPS':>16} {'Description'}")
-        print("  " + "-" * 78)
-        for r in report.cpu_results:
-            print(f"  {r.scenario_id:<4} {r.prompt_length:>6} {r.decode_length:>6} "
-                  f"{r.ttft_median_ms:>7.1f}±{r.ttft_std_ms:<5.1f} "
-                  f"{r.tps_median:>7.1f}±{r.tps_std:<5.1f} "
-                  f"{r.prefill_tps_median:>8.0f}±{r.prefill_tps_std:<6.0f} "
-                  f"{r.description}")
-
-        # Speedup comparison
-        print(f"\n{'Speedup (NPU / CPU)':}")
-        print(f"  {'ID':<4} {'TTFT':>10} {'TPS':>10} {'PrefillTPS':>12}")
+    def _print_table(title: str, results: list[ScalingPoint]):
+        if not results:
+            return
+        print(f"\n{title}:")
+        print(f"  TTFT: {results[0].ttft_ms:.1f} ms")
+        print(f"  {'Position':>10} {'Step(ms)':>14} {'TPS':>10}")
         print("  " + "-" * 38)
-        for npu_r, cpu_r in zip(report.npu_results, report.cpu_results):
-            ttft_sp = cpu_r.ttft_median_ms / npu_r.ttft_median_ms if npu_r.ttft_median_ms > 0 else 0
-            tps_sp = npu_r.tps_median / cpu_r.tps_median if cpu_r.tps_median > 0 else 0
-            pf_sp = npu_r.prefill_tps_median / cpu_r.prefill_tps_median if cpu_r.prefill_tps_median > 0 else 0
-            print(f"  {npu_r.scenario_id:<4} {ttft_sp:>9.2f}x {tps_sp:>9.2f}x {pf_sp:>11.2f}x")
+        for r in results:
+            print(f"  {r.position:>10} {r.step_time_ms:>7.1f}±{r.step_time_std_ms:<5.1f} {r.tps:>9.1f}")
 
-    # Pass/fail criteria
-    print(f"\n{'Pass/Fail Criteria':}")
-    print(f"  Compilation time < 10s:   {'PASS' if report.compile_time_sec < 10 else 'FAIL'} "
-          f"({report.compile_time_sec:.2f}s)")
-    print(f"  Weight load time < 30s:   {'PASS' if report.weight_load_time_sec < 30 else 'FAIL'} "
-          f"({report.weight_load_time_sec:.2f}s)")
+    _print_table("Executor (Direct Metal NPU)", report.executor_results)
+    _print_table("DAGExecutor (Partitioned NPU+CPU)", report.dag_results)
 
-    if include_cpu and report.cpu_results:
-        for npu_r, cpu_r in zip(report.npu_results, report.cpu_results):
-            tps_sp = npu_r.tps_median / cpu_r.tps_median if cpu_r.tps_median > 0 else 0
-            status = "PASS" if tps_sp >= 1.5 else "FAIL"
-            print(f"  {npu_r.scenario_id} TPS ≥ 1.5x CPU:      {status} ({tps_sp:.2f}x)")
+    if report.executor_results and report.dag_results:
+        print(f"\nComparison (DAG / Executor):")
+        print(f"  {'Position':>10} {'Executor TPS':>14} {'DAG TPS':>10} {'Ratio':>8}")
+        print("  " + "-" * 46)
+        dag_by_pos = {r.position: r for r in report.dag_results}
+        for er in report.executor_results:
+            dr = dag_by_pos.get(er.position)
+            if dr:
+                ratio = dr.tps / er.tps if er.tps > 0 else 0
+                print(f"  {er.position:>10} {er.tps:>13.1f} {dr.tps:>9.1f} {ratio:>7.2f}x")
 
     print()
 
 
-def save_chart(report: BenchmarkReport, output_path: str, include_cpu: bool = True):
-    """Generate 3-panel benchmark chart: TTFT, per-step TPS, and throughput."""
+def save_chart(report: ScalingReport, output_path: str):
+    """Generate TPS vs position chart (log-x scale)."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("  [WARN] matplotlib not installed, skipping chart generation")
         return
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Chart 1: Prompt length vs TTFT
+    # Chart 1: TPS vs position
     ax = axes[0]
-    prompt_lens = [r.prompt_length for r in report.npu_results]
-    ttfts = [r.ttft_median_ms for r in report.npu_results]
-    ttft_errs = [r.ttft_std_ms for r in report.npu_results]
-    ax.errorbar(prompt_lens, ttfts, yerr=ttft_errs, marker="o", label="NPU (Metal)")
-    if include_cpu and report.cpu_results:
-        cpu_ttfts = [r.ttft_median_ms for r in report.cpu_results]
-        cpu_errs = [r.ttft_std_ms for r in report.cpu_results]
-        ax.errorbar(prompt_lens, cpu_ttfts, yerr=cpu_errs, marker="s", label="CPU")
-    ax.set_xlabel("Prompt Length (tokens)")
-    ax.set_ylabel("TTFT (ms)")
-    ax.set_title("Prompt Length vs TTFT")
+    if report.executor_results:
+        x = [r.position for r in report.executor_results]
+        y = [r.tps for r in report.executor_results]
+        ax.plot(x, y, marker="o", label="Executor", color="#1f77b4")
+    if report.dag_results:
+        x = [r.position for r in report.dag_results]
+        y = [r.tps for r in report.dag_results]
+        ax.plot(x, y, marker="s", label="DAGExecutor", color="#ff7f0e")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Cache Position (tokens, log2)")
+    ax.set_ylabel("Decode TPS (tokens/sec)")
+    ax.set_title("Decode Speed vs Cache Position")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Chart 2: Per-step TPS vs decode position (use longest decode scenario)
+    # Chart 2: Step time vs position
     ax = axes[1]
-    longest = max(report.npu_results, key=lambda r: len(r.step_tps_median), default=None)
-    if longest and longest.step_tps_median:
-        steps = list(range(1, len(longest.step_tps_median) + 1))
-        ax.plot(steps, longest.step_tps_median, marker="", linewidth=1.2, color="#1f77b4")
-        ax.axhline(y=longest.tps_median, color="red", linestyle="--", alpha=0.7, label=f"Median: {longest.tps_median:.1f}")
-        ax.set_xlabel("Decode Step")
-        ax.set_ylabel("TPS (tokens/sec)")
-        ax.set_title(f"Per-Step TPS ({longest.scenario_id}: {longest.decode_length} tokens)")
-        ax.legend()
-    else:
-        ax.set_title("Per-Step TPS (no data)")
+    if report.executor_results:
+        x = [r.position for r in report.executor_results]
+        y = [r.step_time_ms for r in report.executor_results]
+        yerr = [r.step_time_std_ms for r in report.executor_results]
+        ax.errorbar(x, y, yerr=yerr, marker="o", label="Executor", color="#1f77b4", capsize=3)
+    if report.dag_results:
+        x = [r.position for r in report.dag_results]
+        y = [r.step_time_ms for r in report.dag_results]
+        yerr = [r.step_time_std_ms for r in report.dag_results]
+        ax.errorbar(x, y, yerr=yerr, marker="s", label="DAGExecutor", color="#ff7f0e", capsize=3)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Cache Position (tokens, log2)")
+    ax.set_ylabel("Step Time (ms)")
+    ax.set_title("Per-Step Decode Latency")
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Chart 3: Throughput bar chart (prefill + decode TPS per scenario)
-    ax = axes[2]
-    sids = [r.scenario_id for r in report.npu_results]
-    x = np.arange(len(sids))
-    width = 0.35
-
-    prefill_tps = [r.prefill_tps_median for r in report.npu_results]
-    decode_tps = [r.tps_median for r in report.npu_results]
-
-    bars1 = ax.bar(x - width / 2, prefill_tps, width, label="Prefill (tok/s)", alpha=0.8)
-    bars2 = ax.bar(x + width / 2, decode_tps, width, label="Decode (tok/s)", alpha=0.8)
-
-    # Add value labels on bars
-    for bar in bars1:
-        h = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, h, f"{h:.0f}", ha="center", va="bottom", fontsize=7)
-    for bar in bars2:
-        h = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, h, f"{h:.0f}", ha="center", va="bottom", fontsize=7)
-
-    ax.set_xlabel("Scenario")
-    ax.set_ylabel("Throughput (tokens/sec)")
-    ax.set_title("Throughput by Scenario")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sids)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis="y")
-
+    fig.suptitle(
+        f"Qwen2.5-1.5B Decode Scaling — max_cache={report.max_cache_len}",
+        fontsize=13,
+        y=1.02,
+    )
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"  Chart saved to {output_path}")
     plt.close()
 
 
-def save_json(report: BenchmarkReport, output_path: str):
-    """Save benchmark results as JSON for reproducibility."""
+def save_comparison_chart(report: ScalingReport, output_path: str):
+    """Generate 3-panel Executor vs DAG comparison chart (log-x scale)."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  [WARN] matplotlib not installed, skipping comparison chart")
+        return
+
+    if not report.executor_results or not report.dag_results:
+        print("  [WARN] Need both Executor and DAG results for comparison chart")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+
+    ex_pos = [r.position for r in report.executor_results]
+    dag_pos = [r.position for r in report.dag_results]
+
+    # Panel 1: TPS vs cache position overlay
+    ax = axes[0]
+    ax.plot(ex_pos, [r.tps for r in report.executor_results], marker="o", label="Executor", color="#1f77b4")
+    ax.plot(dag_pos, [r.tps for r in report.dag_results], marker="s", label="DAGExecutor", color="#ff7f0e")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Cache Position (tokens, log2)")
+    ax.set_ylabel("Decode TPS (tokens/sec)")
+    ax.set_title("Decode TPS vs Cache Position")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Step time vs position overlay (with error bars)
+    ax = axes[1]
+    ax.errorbar(
+        ex_pos,
+        [r.step_time_ms for r in report.executor_results],
+        yerr=[r.step_time_std_ms for r in report.executor_results],
+        marker="o",
+        label="Executor",
+        color="#1f77b4",
+        capsize=3,
+    )
+    ax.errorbar(
+        dag_pos,
+        [r.step_time_ms for r in report.dag_results],
+        yerr=[r.step_time_std_ms for r in report.dag_results],
+        marker="s",
+        label="DAGExecutor",
+        color="#ff7f0e",
+        capsize=3,
+    )
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Cache Position (tokens, log2)")
+    ax.set_ylabel("Step Time (ms)")
+    ax.set_title("Per-Step Decode Latency")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3: DAG/Executor TPS ratio vs position
+    ax = axes[2]
+    dag_by_pos = {r.position: r for r in report.dag_results}
+    common_pos = [p for p in ex_pos if p in dag_by_pos]
+    ratios = []
+    for p in common_pos:
+        ex_r = next(r for r in report.executor_results if r.position == p)
+        ratios.append(dag_by_pos[p].tps / ex_r.tps if ex_r.tps > 0 else 0)
+    colors = ["#2ca02c" if r >= 1.0 else "#d62728" for r in ratios]
+    ax.bar(range(len(common_pos)), ratios, color=colors, alpha=0.8)
+    ax.set_xticks(range(len(common_pos)))
+    ax.set_xticklabels([str(p) for p in common_pos], rotation=45, ha="right", fontsize=7)
+    ax.axhline(y=1.0, color="black", linestyle="--", alpha=0.5, label="Parity (1.0)")
+    for i, ratio in enumerate(ratios):
+        ax.text(i, ratio, f"{ratio:.2f}x", ha="center", va="bottom", fontsize=7)
+    ax.set_xlabel("Cache Position")
+    ax.set_ylabel("DAG TPS / Executor TPS")
+    ax.set_title("DAGExecutor Efficiency Ratio")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle(
+        f"Qwen2.5-1.5B Executor vs DAGExecutor — max_cache={report.max_cache_len}",
+        fontsize=13,
+        y=1.02,
+    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"  Comparison chart saved to {output_path}")
+    plt.close()
+
+
+def save_json(report: ScalingReport, output_path: str):
+    """Save benchmark results as JSON."""
+
+    def _points_to_dicts(points: list[ScalingPoint]) -> list[dict]:
+        return [
+            {
+                "position": p.position,
+                "step_time_ms": p.step_time_ms,
+                "step_time_std_ms": p.step_time_std_ms,
+                "tps": p.tps,
+                "ttft_ms": p.ttft_ms,
+            }
+            for p in points
+        ]
+
     data = {
         "environment": report.environment,
         "compile_time_sec": report.compile_time_sec,
         "weight_load_time_sec": report.weight_load_time_sec,
-        "peak_memory_mb": report.peak_memory_mb,
-        "analysis": {
-            "prefill_scaling_ms_per_token": report.prefill_scaling_ms_per_token,
-            "decode_tps_cv_percent": report.decode_tps_cv_percent,
-            "gpu_utilization_percent": report.gpu_utilization_percent,
-            "kernel_launch_overhead_us": report.kernel_launch_overhead_us,
-        },
-        "npu_results": [
-            {
-                "scenario_id": r.scenario_id,
-                "prompt_length": r.prompt_length,
-                "decode_length": r.decode_length,
-                "ttft_median_ms": r.ttft_median_ms,
-                "ttft_std_ms": r.ttft_std_ms,
-                "tps_median": r.tps_median,
-                "tps_std": r.tps_std,
-                "prefill_tps_median": r.prefill_tps_median,
-                "prefill_tps_std": r.prefill_tps_std,
-                "actual_decode_tokens": r.actual_decode_tokens,
-                "step_tps_median": r.step_tps_median,
-            }
-            for r in report.npu_results
-        ],
-        "cpu_results": [
-            {
-                "scenario_id": r.scenario_id,
-                "prompt_length": r.prompt_length,
-                "decode_length": r.decode_length,
-                "ttft_median_ms": r.ttft_median_ms,
-                "ttft_std_ms": r.ttft_std_ms,
-                "tps_median": r.tps_median,
-                "tps_std": r.tps_std,
-                "prefill_tps_median": r.prefill_tps_median,
-                "prefill_tps_std": r.prefill_tps_std,
-                "actual_decode_tokens": r.actual_decode_tokens,
-                "step_tps_median": r.step_tps_median,
-            }
-            for r in report.cpu_results
-        ],
+        "prompt_length": report.prompt_length,
+        "max_cache_len": report.max_cache_len,
+        "executor_results": _points_to_dicts(report.executor_results),
+        "dag_results": _points_to_dicts(report.dag_results),
     }
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)
     print(f"  JSON results saved to {output_path}")
 
 
+def _build_prompt_tokens(tokenizer, prompt_length: int) -> np.ndarray:
+    """Generate token IDs of approximately the target length."""
+    base = "The quick brown fox jumps over the lazy dog. "
+    text = base * (prompt_length // 8 + 1)
+    ids = tokenizer.encode(text, return_tensors="np")[0]
+    if len(ids) >= prompt_length:
+        return ids[:prompt_length]
+    while len(ids) < prompt_length:
+        ids = np.concatenate([ids, ids])
+    return ids[:prompt_length]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark Qwen2.5-1.5B: Metal GPU vs CPU"
+        description="Qwen2.5-1.5B decode scaling benchmark: Executor vs DAGExecutor",
+    )
+    parser.add_argument("--repeats", type=int, default=3, help="Measurements per position (default: 3)")
+    parser.add_argument(
+        "--mode",
+        choices=["executor", "dag", "both"],
+        default="both",
+        help="Which executor(s) to benchmark (default: both)",
+    )
+    parser.add_argument("--chart", type=str, default=None, help="Save chart to file (PNG)")
+    parser.add_argument(
+        "--comparison-chart", type=str, default=None, help="Save Executor vs DAG comparison chart (PNG)"
     )
     parser.add_argument(
-        "--scenarios", nargs="+", default=list(SCENARIOS.keys()),
-        choices=list(SCENARIOS.keys()),
-        help="Scenarios to run (default: all)",
+        "--chart-dir",
+        type=str,
+        default=None,
+        help="Directory to auto-save benchmark_chart.png + benchmark_comparison.png",
     )
-    parser.add_argument("--runs", type=int, default=5, help="Measurement runs (default: 5)")
-    parser.add_argument("--warmup", type=int, default=3, help="Warmup runs (default: 3)")
-    parser.add_argument("--no-cpu", action="store_true", help="Skip CPU baseline")
-    parser.add_argument("--chart", type=str, default=None, help="Save chart to file (PNG)")
     parser.add_argument("--json", type=str, default=None, help="Save results as JSON")
     parser.add_argument("--model-id", default=MODEL_ID, help="HuggingFace model ID")
     parser.add_argument("--prefill-ir", default="qwen2_prefill_ir.json")
     parser.add_argument("--decode-ir", default="qwen2_decode_ir.json")
     parser.add_argument("--kv-mapping", default="qwen2_kv_mapping.json")
+    parser.add_argument(
+        "--prompt-length", type=int, default=PROMPT_LENGTH, help="Prompt length in tokens (default: 64)"
+    )
+    parser.add_argument(
+        "--max-cache-len",
+        type=int,
+        default=MODEL_MAX_POSITION_EMBEDDINGS,
+        help=f"Max KV cache length (default: {MODEL_MAX_POSITION_EMBEDDINGS}, model max_position_embeddings)",
+    )
     args = parser.parse_args()
 
-    include_cpu = not args.no_cpu
-    report = BenchmarkReport()
+    run_executor = args.mode in ("executor", "both")
+    run_dag = args.mode in ("dag", "both")
+    report = ScalingReport()
+    report.prompt_length = args.prompt_length
 
     # 1. Environment
     print("Collecting environment info...")
@@ -839,9 +711,20 @@ def main():
     # 2. Tokenizer
     print("Loading tokenizer...")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
-    # 3. NPU compilation
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    input_ids = _build_prompt_tokens(tokenizer, args.prompt_length)
+
+    # 3. Ensure IR files exist with sufficient max_cache_len
+    print("Checking IR files...")
+    _extract_ir_if_needed(
+        args.prefill_ir,
+        args.decode_ir,
+        args.kv_mapping,
+        needed_max_cache_len=args.max_cache_len,
+    )
+
+    # 4. Compile
     print("Compiling IR...")
     import npu_compiler
     from npu_runtime.device import Device
@@ -851,13 +734,28 @@ def main():
     prefill_program = npu_compiler.compile(args.prefill_ir)
     decode_program = npu_compiler.compile(args.decode_ir)
     report.compile_time_sec = time.perf_counter() - t0
-    print(f"  Compile time: {report.compile_time_sec:.2f}s "
-          f"(prefill: {len(prefill_program.kernel_calls)} kernels, "
-          f"decode: {len(decode_program.kernel_calls)} kernels)")
+    print(f"  Compile time: {report.compile_time_sec:.2f}s")
 
-    # 4. Weight loading
+    # Determine max_cache_len from decode IR
+    with open(args.kv_mapping) as f:
+        kv_map = json.load(f)
+
+    first_kv_name = kv_map["layers"][0]["decode_key_input"]
+    max_cache_len = next(s.shape[2] for s in decode_program.input_specs if s.name == first_kv_name)
+    prefill_seq_len = prefill_program.input_specs[0].shape[1]
+    report.max_cache_len = max_cache_len
+
+    print(f"  max_cache_len={max_cache_len}, prefill_seq_len={prefill_seq_len}")
+
+    # Generate log-scale positions
+    max_decode_steps = max_cache_len - prefill_seq_len
+    positions = _log_scale_steps(max_decode_steps)
+    print(f"  Test positions (log-scale): {positions}")
+
+    # 5. Load weights
     print("Loading weights...")
     from hf_utils import load_weights_from_hf
+
     device = Device()
 
     t0 = time.perf_counter()
@@ -866,94 +764,66 @@ def main():
     report.weight_load_time_sec = time.perf_counter() - t0
     print(f"  Weight load time: {report.weight_load_time_sec:.2f}s")
 
-    # 5. Peak memory
-    report.peak_memory_mb = estimate_peak_memory_mb(prefill_program, decode_program)
-    print(f"  Peak memory (est): {report.peak_memory_mb:.1f} MB")
+    # 6. Executor benchmark
+    if run_executor:
+        print(f"\n{'=' * 60}")
+        print("Benchmarking Executor (Direct Metal NPU)")
+        print(f"{'=' * 60}")
 
-    # 6. KV mapping
-    with open(args.kv_mapping) as f:
-        kv_map = json.load(f)
+        prefill_executor = Executor(prefill_program, device)
+        decode_executor = Executor(decode_program, device)
 
-    # 7. Create executors
-    prefill_executor = Executor(prefill_program, device)
-    decode_executor = Executor(decode_program, device)
-
-    # Note: IR has fixed prefill_seq_len; prompts longer than this are truncated.
-    prefill_seq_len = prefill_program.input_specs[0].shape[1]
-    print(f"  IR prefill_seq_len: {prefill_seq_len} "
-          f"(prompts > {prefill_seq_len} tokens will be truncated)")
-
-    # 8. NPU benchmarks
-    for sid in args.scenarios:
-        prompt_len, decode_len, desc = SCENARIOS[sid]
-        effective_prompt = min(prompt_len, prefill_seq_len)
-        print(f"\n[{sid}] NPU: prompt={prompt_len} (effective={effective_prompt}), "
-              f"decode={decode_len} — {desc}")
-
-        result = benchmark_npu_scenario(
-            sid, prompt_len, decode_len, desc,
-            prefill_executor, decode_executor,
-            prefill_program, decode_program,
-            prefill_weights, decode_weights,
-            kv_map, device, tokenizer,
-            warmup=args.warmup, runs=args.runs,
+        report.executor_results, _ = benchmark_executor_scaling(
+            positions=positions,
+            prefill_executor=prefill_executor,
+            decode_executor=decode_executor,
+            prefill_program=prefill_program,
+            decode_program=decode_program,
+            prefill_weights=prefill_weights,
+            decode_weights=decode_weights,
+            kv_map=kv_map,
+            device=device,
+            input_ids=input_ids,
+            repeats=args.repeats,
         )
-        report.npu_results.append(result)
-        print(f"  TTFT: {result.ttft_median_ms:.1f}±{result.ttft_std_ms:.1f}ms  "
-              f"TPS: {result.tps_median:.1f}±{result.tps_std:.1f}  "
-              f"Prefill TPS: {result.prefill_tps_median:.0f}±{result.prefill_tps_std:.0f}")
 
-    # 9. Analysis metrics (scaling, GPU utilization, kernel overhead)
-    print("\nComputing analysis metrics...")
-    report.prefill_scaling_ms_per_token = compute_prefill_scaling(report.npu_results)
-    report.decode_tps_cv_percent = compute_decode_scaling_cv(report.npu_results)
+    # 7. DAGExecutor benchmark
+    if run_dag:
+        print(f"\n{'=' * 60}")
+        print("Benchmarking DAGExecutor (Partitioned NPU+CPU)")
+        print(f"{'=' * 60}")
 
-    # GPU utilization and kernel overhead: run a quick decode step measurement
-    input_ids = _build_prompt_tokens(tokenizer, 64)
-    outputs, _, next_token, actual_len = _npu_prefill(
-        prefill_executor, prefill_program, prefill_weights, input_ids, device
-    )
-    gpu_util, kernel_overhead = estimate_gpu_utilization(
-        decode_executor, decode_program, decode_weights, device, kv_map,
-        outputs, prefill_program, actual_len, next_token, tokenizer,
-    )
-    report.gpu_utilization_percent = gpu_util
-    report.kernel_launch_overhead_us = kernel_overhead
-    print(f"  Prefill scaling: {report.prefill_scaling_ms_per_token:.3f} ms/token")
-    print(f"  Decode TPS CV: {report.decode_tps_cv_percent:.1f}%")
-    print(f"  GPU utilization: {report.gpu_utilization_percent:.1f}%")
-    print(f"  Kernel overhead: {report.kernel_launch_overhead_us:.1f} μs/kernel")
-
-    # 10. CPU baseline
-    if include_cpu:
-        print("\nLoading CPU model for baseline...")
-        import torch
-        from transformers import AutoModelForCausalLM
-        cpu_model = AutoModelForCausalLM.from_pretrained(
-            args.model_id, torch_dtype=torch.float32
+        report.dag_results, _ = benchmark_dag_scaling(
+            positions=positions,
+            prefill_ir_path=args.prefill_ir,
+            decode_ir_path=args.decode_ir,
+            kv_mapping_path=args.kv_mapping,
+            model_id=args.model_id,
+            input_ids=input_ids,
+            repeats=args.repeats,
         )
-        cpu_model.eval()
 
-        for sid in args.scenarios:
-            prompt_len, decode_len, desc = SCENARIOS[sid]
-            print(f"\n[{sid}] CPU: prompt={prompt_len}, decode={decode_len} — {desc}")
+    # 8. Report
+    print_report(report)
 
-            result = benchmark_cpu_scenario(
-                sid, prompt_len, decode_len, desc,
-                cpu_model, tokenizer,
-                warmup=args.warmup, runs=args.runs,
-            )
-            report.cpu_results.append(result)
-            print(f"  TTFT: {result.ttft_median_ms:.1f}±{result.ttft_std_ms:.1f}ms  "
-                  f"TPS: {result.tps_median:.1f}±{result.tps_std:.1f}  "
-                  f"Prefill TPS: {result.prefill_tps_median:.0f}±{result.prefill_tps_std:.0f}")
+    # Determine chart paths
+    chart_path = args.chart
+    comparison_chart_path = args.comparison_chart
+    if args.chart_dir:
+        os.makedirs(args.chart_dir, exist_ok=True)
+        if not chart_path:
+            chart_path = os.path.join(args.chart_dir, "benchmark_chart.png")
+        if not comparison_chart_path:
+            comparison_chart_path = os.path.join(args.chart_dir, "benchmark_comparison.png")
 
-    # 11. Report
-    print_report(report, include_cpu=include_cpu)
-
-    if args.chart:
-        save_chart(report, args.chart, include_cpu=include_cpu)
+    if chart_path:
+        os.makedirs(os.path.dirname(os.path.abspath(chart_path)), exist_ok=True)
+        save_chart(report, chart_path)
+    if comparison_chart_path and report.executor_results and report.dag_results:
+        os.makedirs(os.path.dirname(os.path.abspath(comparison_chart_path)), exist_ok=True)
+        save_comparison_chart(report, comparison_chart_path)
     if args.json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         save_json(report, args.json)
 
 

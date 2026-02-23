@@ -5,20 +5,21 @@ Performance benchmarks for Qwen2.5-1.5B-Instruct running on the Metal GPU backen
 ## Methodology
 
 - **Model**: Qwen2.5-1.5B-Instruct (BFloat16)
-- **IR config**: prefill_seq_len=1024, max_cache_len=2048
-- **Measurement**: 5 runs with 3 warmup runs, reporting median and stddev
-- **Metrics**: TTFT (Time To First Token), TPS (Tokens Per Second), Prefill throughput
+- **Approach**: Single-step timing at log-scale cache positions (avoids full decode loops)
+- **Measurement**: 3 measurements per position, reporting median and stddev
+- **Metrics**: TTFT (Time To First Token), TPS (Tokens Per Second), Step Time (ms)
 
-### Scenarios
+At each cache position, a KV cache is filled with random data and a single
+decode step is timed. This isolates decode latency from autoregressive overhead
+and measures how performance scales with context length.
 
-| ID | Prompt | Decode | Description |
-|----|--------|--------|-------------|
-| S1 | 16 | 32 | Minimal load (overhead ratio) |
-| S2 | 64 | 64 | Short conversation |
-| S3 | 256 | 128 | Medium conversation |
-| S4 | 512 | 256 | Long context |
-| S5 | 1024 | 128 | Long document summarization (prefill-heavy) |
-| S6 | 64 | 512 | Short question + long response (decode-heavy) |
+### Test Positions
+
+Positions are generated on a log₂ scale from 1 to `max_cache_len - prefill_seq_len`:
+
+```
+1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, ...
+```
 
 ## Results
 
@@ -26,66 +27,73 @@ Performance benchmarks for Qwen2.5-1.5B-Instruct running on the Metal GPU backen
     Apple M4 Pro, 48 GB RAM, macOS 26.2, Python 3.14.0.
     Results may vary depending on hardware.
 
-### NPU (Metal GPU)
+### Scaling Results (max_cache_len=32768)
 
-| ID | Prompt | Decode | TTFT (ms) | Decode TPS | Prefill TPS |
-|----|--------|--------|-----------|------------|-------------|
-| S1 | 16 | 32 | 4497.9 ± 33.9 | 16.6 ± 0.2 | 4 |
-| S2 | 64 | 64 | 4476.5 ± 10.1 | 16.6 ± 0.5 | 14 |
-| S3 | 256 | 128 | 4493.2 ± 15.2 | 15.9 ± 0.0 | 57 |
-| S4 | 512 | 256 | 4499.7 ± 3.0 | 15.1 ± 0.0 | 114 |
-| S5 | 1024 | 128 | 4492.2 ± 19.9 | 13.9 ± 0.0 | 228 |
-| S6 | 64 | 512 | 4487.8 ± 11.1 | 15.7 ± 0.1 | 14 |
+| Position | Executor TPS | Executor Step (ms) | DAG TPS | DAG Step (ms) | Ratio |
+|----------|-------------|-------------------|---------|---------------|-------|
+| 1 | 2.8 | 359.5 | 2.7 | 372.1 | 0.97x |
+| 2 | 2.8 | 360.8 | 2.8 | 362.1 | 1.00x |
+| 4 | 2.8 | 360.9 | 2.8 | 362.8 | 0.99x |
+| 8 | 2.8 | 361.8 | 2.8 | 361.8 | 1.00x |
+| 16 | 2.8 | 361.1 | 2.8 | 362.1 | 1.00x |
+| 32 | 2.8 | 361.3 | 2.8 | 362.5 | 1.00x |
+| 64 | 2.8 | 361.8 | 2.8 | 362.2 | 1.00x |
+| 128 | 2.8 | 363.5 | 2.7 | 363.9 | 1.00x |
+| 256 | 2.7 | 365.3 | 2.7 | 365.5 | 1.00x |
+| 512 | 2.7 | 368.7 | 2.7 | 369.4 | 1.00x |
+| 1024 | 2.7 | 374.9 | 2.7 | 375.4 | 1.00x |
+| 2048 | 2.6 | 389.7 | 2.6 | 390.3 | 1.00x |
+| 4096 | 2.4 | 417.1 | 2.4 | 420.6 | 0.99x |
+| 8192 | 2.1 | 475.3 | 2.1 | 474.6 | 1.00x |
+| 16384 | 1.7 | 588.4 | 1.7 | 590.3 | 1.00x |
+| 32640 | 1.2 | 813.6 | 1.2 | 818.2 | 0.99x |
 
 | Metric | Value |
 |--------|-------|
-| Compile time | 0.16 sec |
-| Weight load time | 5.69 sec |
-| Peak memory (est) | 11,505 MB |
-| Prefill scaling | 0.006 ms/token |
-| Decode TPS CV | 5.9% |
-| GPU utilization (est) | 95.5% |
-| Kernel overhead | 44.1 us/kernel |
+| Compile time | 0.19 sec |
+| Weight load time | 1.44 sec |
+| DAG/Executor TPS ratio | ~1.00x |
 
 ### Charts
 
-![Benchmark Charts](assets/benchmark_chart.png)
+![Benchmark Chart](assets/benchmark_chart.png)
 
-**Chart 1 — TTFT vs Prompt Length**: Shows how prefill latency scales with prompt length.
-Linear scaling indicates efficient chunked prefill.
+**Panel 1 — TPS vs Cache Position**: Shows how decode throughput scales with KV cache size (log₂ x-axis).
+Both Executor and DAGExecutor lines are overlaid for comparison.
 
-**Chart 2 — Per-Step TPS**: Shows decode throughput at each step for the longest decode scenario (S6).
-Flat lines indicate consistent decode performance without degradation.
+**Panel 2 — Step Time vs Cache Position**: Per-step decode latency with error bars (log₂ x-axis).
 
-**Chart 3 — Throughput by Scenario**: Compares prefill throughput and decode TPS across all scenarios.
+### Executor vs DAGExecutor Comparison
 
-### Analysis Metrics
+![Comparison Chart](assets/benchmark_comparison.png)
 
-| Metric | Description | Ideal |
-|--------|-------------|-------|
-| Prefill scaling | TTFT increase per prompt token (ms/tok) | Linear |
-| Decode TPS CV | Coefficient of variation across scenarios | ~0% |
-| GPU utilization | Estimated kernel time / total time | >95% |
-| Kernel overhead | Per-kernel launch overhead | <10 us |
+**Panel 1 — TPS vs Cache Position**: Executor and DAGExecutor decode speed overlay.
+
+**Panel 2 — Step Time vs Cache Position**: Latency comparison with error bars.
+
+**Panel 3 — Efficiency Ratio**: DAGExecutor TPS as a fraction of Executor TPS at each position.
+Values near 1.0 indicate minimal partition overhead.
 
 ## Reproducing
 
 ```bash
 # 1. Extract IR (requires transformers + torch)
 cd examples/
-python extract_qwen_ir.py --prefill-seq-len 1024 --max-cache-len 2048
+python extract_qwen_ir.py --prefill-seq-len 128 --max-cache-len 32768
 
-# 2. Run benchmark
-python ../benchmarks/benchmark_qwen.py --no-cpu \
-    --chart ../docs/assets/benchmark_chart.png \
-    --json ../benchmarks/results/benchmark_results.json
-
-# 3. With CPU baseline (slower)
+# 2. Run integrated benchmark (Executor + DAGExecutor)
 python ../benchmarks/benchmark_qwen.py \
-    --chart ../docs/assets/benchmark_chart.png \
+    --mode both \
+    --chart-dir ../docs/assets/ \
     --json ../benchmarks/results/benchmark_results.json
+
+# Or run only one executor type:
+python ../benchmarks/benchmark_qwen.py --mode executor --chart chart.png
+python ../benchmarks/benchmark_qwen.py --mode dag --chart chart.png
 ```
 
 ## JSON Results
 
-Full results are saved to `benchmarks/results/benchmark_results.json` for automated analysis and CI integration.
+Full results are saved to `benchmarks/results/` for automated analysis and CI integration:
+
+- `benchmark_results.json` — Combined Executor + DAGExecutor scaling results

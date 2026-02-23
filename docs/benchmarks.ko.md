@@ -5,20 +5,21 @@ Metal GPU 백엔드에서 실행되는 Qwen2.5-1.5B-Instruct 성능 벤치마크
 ## 측정 방법
 
 - **모델**: Qwen2.5-1.5B-Instruct (BFloat16)
-- **IR 설정**: prefill_seq_len=1024, max_cache_len=2048
-- **측정**: 3회 워밍업 후 5회 실행, 중앙값 및 표준편차 기록
-- **지표**: TTFT (첫 토큰까지 시간), TPS (초당 토큰 수), Prefill 처리량
+- **접근법**: 로그 스케일 캐시 위치에서 단일 스텝 타이밍 (전체 디코드 루프 불필요)
+- **측정**: 위치당 3회 측정, 중앙값 및 표준편차 기록
+- **지표**: TTFT (첫 토큰까지 시간), TPS (초당 토큰 수), Step Time (ms)
 
-### 시나리오
+각 캐시 위치에서 KV 캐시를 랜덤 데이터로 채우고 단일 디코드 스텝의 시간을
+측정합니다. 이를 통해 autoregressive 오버헤드 없이 디코드 지연 시간을 분리하고,
+컨텍스트 길이에 따른 성능 스케일링을 측정합니다.
 
-| ID | 프롬프트 | 디코드 | 설명 |
-|----|---------|--------|------|
-| S1 | 16 | 32 | 최소 부하 (오버헤드 비율) |
-| S2 | 64 | 64 | 짧은 대화 |
-| S3 | 256 | 128 | 중간 대화 |
-| S4 | 512 | 256 | 긴 컨텍스트 |
-| S5 | 1024 | 128 | 긴 문서 요약 (prefill 중심) |
-| S6 | 64 | 512 | 짧은 질문 + 긴 응답 (decode 중심) |
+### 테스트 위치
+
+위치는 1에서 `max_cache_len - prefill_seq_len`까지 log₂ 스케일로 생성됩니다:
+
+```
+1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, ...
+```
 
 ## 결과
 
@@ -26,66 +27,73 @@ Metal GPU 백엔드에서 실행되는 Qwen2.5-1.5B-Instruct 성능 벤치마크
     Apple M4 Pro, 48 GB RAM, macOS 26.2, Python 3.14.0.
     결과는 하드웨어에 따라 달라질 수 있습니다.
 
-### NPU (Metal GPU)
+### 스케일링 결과 (max_cache_len=32768)
 
-| ID | 프롬프트 | 디코드 | TTFT (ms) | Decode TPS | Prefill TPS |
-|----|---------|--------|-----------|------------|-------------|
-| S1 | 16 | 32 | 4497.9 ± 33.9 | 16.6 ± 0.2 | 4 |
-| S2 | 64 | 64 | 4476.5 ± 10.1 | 16.6 ± 0.5 | 14 |
-| S3 | 256 | 128 | 4493.2 ± 15.2 | 15.9 ± 0.0 | 57 |
-| S4 | 512 | 256 | 4499.7 ± 3.0 | 15.1 ± 0.0 | 114 |
-| S5 | 1024 | 128 | 4492.2 ± 19.9 | 13.9 ± 0.0 | 228 |
-| S6 | 64 | 512 | 4487.8 ± 11.1 | 15.7 ± 0.1 | 14 |
+| Position | Executor TPS | Executor Step (ms) | DAG TPS | DAG Step (ms) | Ratio |
+|----------|-------------|-------------------|---------|---------------|-------|
+| 1 | 2.8 | 359.5 | 2.7 | 372.1 | 0.97x |
+| 2 | 2.8 | 360.8 | 2.8 | 362.1 | 1.00x |
+| 4 | 2.8 | 360.9 | 2.8 | 362.8 | 0.99x |
+| 8 | 2.8 | 361.8 | 2.8 | 361.8 | 1.00x |
+| 16 | 2.8 | 361.1 | 2.8 | 362.1 | 1.00x |
+| 32 | 2.8 | 361.3 | 2.8 | 362.5 | 1.00x |
+| 64 | 2.8 | 361.8 | 2.8 | 362.2 | 1.00x |
+| 128 | 2.8 | 363.5 | 2.7 | 363.9 | 1.00x |
+| 256 | 2.7 | 365.3 | 2.7 | 365.5 | 1.00x |
+| 512 | 2.7 | 368.7 | 2.7 | 369.4 | 1.00x |
+| 1024 | 2.7 | 374.9 | 2.7 | 375.4 | 1.00x |
+| 2048 | 2.6 | 389.7 | 2.6 | 390.3 | 1.00x |
+| 4096 | 2.4 | 417.1 | 2.4 | 420.6 | 0.99x |
+| 8192 | 2.1 | 475.3 | 2.1 | 474.6 | 1.00x |
+| 16384 | 1.7 | 588.4 | 1.7 | 590.3 | 1.00x |
+| 32640 | 1.2 | 813.6 | 1.2 | 818.2 | 0.99x |
 
 | 지표 | 값 |
 |------|-----|
-| 컴파일 시간 | 0.16 sec |
-| 가중치 로딩 시간 | 5.69 sec |
-| 피크 메모리 (추정) | 11,505 MB |
-| Prefill 스케일링 | 0.006 ms/token |
-| Decode TPS CV | 5.9% |
-| GPU 활용률 (추정) | 95.5% |
-| 커널 오버헤드 | 44.1 us/kernel |
+| 컴파일 시간 | 0.19 sec |
+| 가중치 로딩 시간 | 1.44 sec |
+| DAG/Executor TPS 비율 | ~1.00x |
 
 ### 차트
 
 ![벤치마크 차트](assets/benchmark_chart.png)
 
-**차트 1 — TTFT vs 프롬프트 길이**: 프롬프트 길이에 따른 prefill 지연 시간.
-선형 스케일링은 효율적인 chunked prefill을 나타냅니다.
+**패널 1 — TPS vs 캐시 위치**: KV 캐시 크기에 따른 디코드 처리량 (log₂ x축).
+Executor와 DAGExecutor가 비교를 위해 겹쳐 표시됩니다.
 
-**차트 2 — 스텝별 TPS**: 가장 긴 디코드 시나리오(S6)에서 각 스텝의 디코드 처리량.
-평평한 선은 성능 저하 없이 일관된 디코드 성능을 나타냅니다.
+**패널 2 — Step Time vs 캐시 위치**: 오차 막대가 있는 스텝별 디코드 지연 시간 (log₂ x축).
 
-**차트 3 — 시나리오별 처리량**: 모든 시나리오에서 prefill 처리량과 디코드 TPS를 비교합니다.
+### Executor vs DAGExecutor 비교
 
-### 분석 지표
+![비교 차트](assets/benchmark_comparison.png)
 
-| 지표 | 설명 | 이상적 |
-|------|------|--------|
-| Prefill 스케일링 | 프롬프트 토큰당 TTFT 증가 (ms/tok) | 선형 |
-| Decode TPS CV | 시나리오 간 변동 계수 | ~0% |
-| GPU 활용률 | 커널 시간 / 전체 시간 추정 | >95% |
-| 커널 오버헤드 | 커널당 실행 오버헤드 | <10 us |
+**패널 1 — TPS vs 캐시 위치**: Executor와 DAGExecutor 디코드 속도 오버레이.
+
+**패널 2 — Step Time vs 캐시 위치**: 오차 막대가 있는 지연 시간 비교.
+
+**패널 3 — 효율 비율**: 각 위치에서 Executor 대비 DAGExecutor TPS 비율.
+1.0에 가까울수록 파티션 오버헤드가 적음을 의미합니다.
 
 ## 재현 방법
 
 ```bash
 # 1. IR 추출 (transformers + torch 필요)
 cd examples/
-python extract_qwen_ir.py --prefill-seq-len 1024 --max-cache-len 2048
+python extract_qwen_ir.py --prefill-seq-len 128 --max-cache-len 32768
 
-# 2. 벤치마크 실행
-python ../benchmarks/benchmark_qwen.py --no-cpu \
-    --chart ../docs/assets/benchmark_chart.png \
-    --json ../benchmarks/results/benchmark_results.json
-
-# 3. CPU 기준선 포함 (더 느림)
+# 2. 통합 벤치마크 실행 (Executor + DAGExecutor)
 python ../benchmarks/benchmark_qwen.py \
-    --chart ../docs/assets/benchmark_chart.png \
+    --mode both \
+    --chart-dir ../docs/assets/ \
     --json ../benchmarks/results/benchmark_results.json
+
+# 또는 하나의 executor만 실행:
+python ../benchmarks/benchmark_qwen.py --mode executor --chart chart.png
+python ../benchmarks/benchmark_qwen.py --mode dag --chart chart.png
 ```
 
 ## JSON 결과
 
-전체 결과는 `benchmarks/results/benchmark_results.json`에 저장되며, 자동화된 분석 및 CI 통합에 활용할 수 있습니다.
+전체 결과는 `benchmarks/results/`에 저장되며, 자동화된 분석 및 CI 통합에 활용할 수 있습니다:
+
+- `benchmark_results.json` — Executor + DAGExecutor 통합 스케일링 결과
