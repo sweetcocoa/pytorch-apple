@@ -127,6 +127,54 @@ def _build_sub_ir(
     )
 
 
+def build_cpu_executor(
+    partition_nodes: list[dict],
+    weights: dict[str, np.ndarray],
+    weight_name_mapping: dict[str, str] | None = None,
+) -> tuple[IR, IRExecutor, dict[str, torch.Tensor]]:
+    """Build and return a reusable CPU executor for a partition.
+
+    Returns:
+        Tuple of (sub_ir, executor, torch_weights) that can be cached and reused.
+    """
+    # Build a dummy tensor_pool with just weight names so _build_sub_ir can
+    # classify external inputs correctly.
+    sub_ir = _build_sub_ir(partition_nodes, {}, weights, weight_name_mapping)
+
+    torch_weights = {}
+    for w in sub_ir.weights:
+        name = w.name
+        if name in weights:
+            torch_weights[name] = _numpy_to_torch(weights[name])
+        elif weight_name_mapping:
+            sd_key = weight_name_mapping.get(name)
+            if sd_key and sd_key in weights:
+                torch_weights[name] = _numpy_to_torch(weights[sd_key])
+
+    executor = IRExecutor(sub_ir, weights=torch_weights)
+    return sub_ir, executor, torch_weights
+
+
+def execute_cpu_partition_cached(
+    sub_ir: IR,
+    executor: IRExecutor,
+    tensor_pool: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Execute a cached CPU partition executor with the given tensor pool.
+
+    Args:
+        sub_ir: Pre-built IR for this partition.
+        executor: Pre-built IRExecutor for this partition.
+        tensor_pool: Name->ndarray mapping of available tensors.
+
+    Returns:
+        Dict mapping output tensor names -> numpy arrays produced by this partition.
+    """
+    input_tensors = [_numpy_to_torch(tensor_pool[gi.name]) for gi in sub_ir.graph_inputs]
+    outputs = executor.execute(tuple(input_tensors))
+    return {out_meta.name: _torch_to_numpy(outputs[i]) for i, out_meta in enumerate(sub_ir.graph_outputs)}
+
+
 def _numpy_to_torch(arr: np.ndarray) -> torch.Tensor:
     """Convert numpy array to torch tensor, handling bfloat16."""
     if arr.dtype == np.uint16:

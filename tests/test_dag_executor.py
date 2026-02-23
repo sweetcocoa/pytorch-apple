@@ -17,8 +17,18 @@ from torch_ir import extract_ir
 
 from npu_compiler.op_support import is_op_supported
 from npu_compiler.partitioner import Partition, partition
+from npu_runtime.backend import DeviceBuffer
 from npu_runtime.dag_executor import DAGExecutor
 from npu_runtime.metal_backend import MetalBackend
+
+
+def _to_numpy(val):
+    """Convert a result value (numpy or DeviceBuffer) to numpy array."""
+    if isinstance(val, np.ndarray):
+        return val
+    if isinstance(val, DeviceBuffer):
+        return val.to_numpy()
+    return np.asarray(val)
 
 
 def _extract_ir_dict(model_cls, example_input_shape, model_name="test") -> dict:
@@ -124,7 +134,7 @@ class TestDAGExecutorAllSupported:
         with torch.no_grad():
             cpu_output = model(input_tensor).numpy()
 
-        npu_output = list(result.values())[0]
+        npu_output = _to_numpy(list(result.values())[0])
         npt.assert_allclose(npu_output, cpu_output, rtol=5e-2, atol=5e-2)
         assert np.argmax(npu_output) == np.argmax(cpu_output)
 
@@ -169,7 +179,7 @@ class TestDAGExecutorMixed:
         with torch.no_grad():
             cpu_output = model(input_tensor).numpy()
 
-        npu_output = list(result.values())[0]
+        npu_output = _to_numpy(list(result.values())[0])
         npt.assert_allclose(npu_output, cpu_output, rtol=5e-2, atol=5e-2)
         assert np.argmax(npu_output) == np.argmax(cpu_output)
 
@@ -201,7 +211,7 @@ class TestDAGExecutorResNet:
         with torch.no_grad():
             cpu_output = model(input_tensor).numpy()
 
-        npu_output = list(result.values())[0]
+        npu_output = _to_numpy(list(result.values())[0])
         npt.assert_allclose(npu_output, cpu_output, rtol=1e-1, atol=1e-1)
         assert np.argmax(npu_output) == np.argmax(cpu_output)
 
@@ -304,6 +314,6 @@ class TestDAGExecutorResNet:
         with torch.no_grad():
             cpu_output = model(input_tensor).numpy()
 
-        npu_output = list(result.values())[0]
+        npu_output = _to_numpy(list(result.values())[0])
         npt.assert_allclose(npu_output, cpu_output, rtol=1e-1, atol=1e-1)
         assert np.argmax(npu_output) == np.argmax(cpu_output)

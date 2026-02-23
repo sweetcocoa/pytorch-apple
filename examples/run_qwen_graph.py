@@ -222,7 +222,8 @@ def main():
     npu_time = time.time() - t0
     print(f"  NPU prefill time: {npu_time:.3f}s")
 
-    npu_logits = list(result.values())[0]
+    npu_logits_raw = list(result.values())[0]
+    npu_logits = npu_logits_raw.to_numpy() if hasattr(npu_logits_raw, "to_numpy") else npu_logits_raw
     next_token = int(np.argmax(npu_logits[0, actual_len - 1, :]))
     print(f"  Next token: {next_token} ({tokenizer.decode([next_token])})")
 

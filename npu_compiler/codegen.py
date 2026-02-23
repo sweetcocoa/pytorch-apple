@@ -38,14 +38,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from npu_compiler.target_config import pad_channels, padded_shape_4d
 from npu_compiler.fusion_patterns import FusedGroup, find_fusion_groups
 from npu_compiler.ir_reader import IRGraph, OpNode, TensorSpec
-
+from npu_compiler.layout import LayoutProfile, resolve_layouts
+from npu_compiler.target_config import pad_channels, padded_shape_4d
 
 # ---------------------------------------------------------------------------
 # CodegenTarget: abstract interface for backend-specific kernel emission
 # ---------------------------------------------------------------------------
+
 
 class CodegenTarget(ABC):
     """Abstract interface for backend-specific code generation.
@@ -133,22 +134,24 @@ _OP_NORMALIZE = {
 @dataclass
 class KernelCall:
     """A single Metal kernel invocation."""
-    kernel_name: str       # Metal function name
-    kernel_source: str     # shader source file path (e.g. .metal)
-    input_buffers: list[str]   # buffer names for inputs
+
+    kernel_name: str  # Metal function name
+    kernel_source: str  # shader source file path (e.g. .metal)
+    input_buffers: list[str]  # buffer names for inputs
     output_buffers: list[str]  # buffer names for outputs
-    param_buffers: list[str]   # named param buffers
-    params: dict               # kernel parameters (for struct packing)
+    param_buffers: list[str]  # named param buffers
+    params: dict  # kernel parameters (for struct packing)
     dispatch_type: str = "1d"  # "1d", "2d", or "3d"
-    total_threads: int = 0     # for 1d dispatch
-    grid_width: int = 0        # for 2d dispatch
-    grid_height: int = 0       # for 2d dispatch
-    grid_depth: int = 0        # for 3d dispatch
+    total_threads: int = 0  # for 1d dispatch
+    grid_width: int = 0  # for 2d dispatch
+    grid_height: int = 0  # for 2d dispatch
+    grid_depth: int = 0  # for 3d dispatch
 
 
 @dataclass
 class BufferAllocation:
     """Memory allocation for an intermediate buffer."""
+
     name: str
     shape: list[int]
     alloc_shape: list[int] | None = None  # physical shape (None = same as shape)
@@ -159,6 +162,7 @@ class BufferAllocation:
 @dataclass
 class ExecutionPlan:
     """Complete execution plan for a compiled program."""
+
     kernel_calls: list[KernelCall]
     buffer_allocations: list[BufferAllocation]
     input_specs: list[TensorSpec]
@@ -172,10 +176,10 @@ class ExecutionPlan:
 _DTYPE_ELEM_SIZE = {"float16": 2, "bfloat16": 2, "float32": 4, "int32": 4, "int64": 8}
 
 
-def _size_bytes(shape, dtype="float16"):
+def _size_bytes(shape, dtype="float16", pad_4d=False):
     elem_size = _DTYPE_ELEM_SIZE.get(dtype, 2)
-    padded = padded_shape_4d(shape)
-    return int(np.prod(padded)) * elem_size
+    final_shape = padded_shape_4d(shape) if pad_4d else shape
+    return int(np.prod(final_shape)) * elem_size
 
 
 def _infer_compute_dtype(graph: IRGraph) -> str:
@@ -253,12 +257,14 @@ def _gen_binary_op(node: OpNode, op_type: str) -> KernelCall | list[KernelCall]:
             output_buffers=[node.outputs[0].name],
             param_buffers=["broadcast_binary_params"],
             params={
-                "ndim": ndim, "total": total,
+                "ndim": ndim,
+                "total": total,
                 "a_strides": a_strides + [0] * (_MAX_NDIM - ndim),
                 "b_strides": b_strides + [0] * (_MAX_NDIM - ndim),
                 "out_shape": list(out_shape) + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
     else:
         # Same-shape: use simple elementwise kernel
@@ -269,8 +275,10 @@ def _gen_binary_op(node: OpNode, op_type: str) -> KernelCall | list[KernelCall]:
             kernel_source=_ELEMENTWISE_BINARY_METAL_FILE[op_type],
             input_buffers=[a_name, b_name],
             output_buffers=[node.outputs[0].name],
-            param_buffers=[], params={},
-            dispatch_type="1d", total_threads=padded_total,
+            param_buffers=[],
+            params={},
+            dispatch_type="1d",
+            total_threads=padded_total,
         )
 
 
@@ -292,12 +300,26 @@ def _build_io_transforms(spec: TensorSpec, compute_dtype: str = "bfloat16") -> l
     return steps
 
 
+def generate_execution_plan(graph: IRGraph, profile: LayoutProfile | None = None) -> ExecutionPlan:
+    """Generate a Metal execution plan from an IR graph.
 
-def generate_execution_plan(graph: IRGraph) -> ExecutionPlan:
-    """Generate a Metal execution plan from an IR graph."""
+    Args:
+        graph: The IR graph to compile.
+        profile: Optional layout profile for backend-specific layout overrides.
+                 Defaults to METAL_PROFILE (PADDED_NCHW for conv/pool ops).
+    """
     _normalize_ops(graph)
     fusion_result = find_fusion_groups(graph)
     compute_dtype = _infer_compute_dtype(graph)
+
+    # Resolve layouts for all tensors using the layout system
+    tensor_layouts = resolve_layouts(
+        nodes=fusion_result,
+        graph_inputs=graph.graph_inputs,
+        weights=graph.weights,
+        weight_name_mapping=graph.weight_name_mapping,
+        profile=profile,
+    )
 
     kernel_calls = []
     buffer_allocs = []
@@ -313,13 +335,21 @@ def generate_execution_plan(graph: IRGraph) -> ExecutionPlan:
 
     def ensure_buffer(name: str, shape: list[int], dtype: str = compute_dtype):
         if name not in external_names and name not in allocated_buffers:
-            padded = padded_shape_4d(shape)
-            buffer_allocs.append(BufferAllocation(
-                name=name, shape=shape,
-                alloc_shape=padded if padded != list(shape) else None,
-                dtype=dtype,
-                size_bytes=_size_bytes(shape, dtype),
-            ))
+            # Use resolved layout for physical shape instead of hardcoded _PADDED_KERNELS
+            resolved = tensor_layouts.get(name)
+            if resolved and resolved.needs_padding:
+                alloc_shape = resolved.physical_shape
+            else:
+                alloc_shape = list(shape)
+            buffer_allocs.append(
+                BufferAllocation(
+                    name=name,
+                    shape=shape,
+                    alloc_shape=alloc_shape if alloc_shape != list(shape) else None,
+                    dtype=dtype,
+                    size_bytes=int(np.prod(alloc_shape)) * _DTYPE_ELEM_SIZE.get(dtype, 2),
+                )
+            )
             allocated_buffers.add(name)
 
     for item in fusion_result:
@@ -349,14 +379,20 @@ def generate_execution_plan(graph: IRGraph) -> ExecutionPlan:
                     if bcast_shape:
                         ensure_buffer(buf_name, bcast_shape)
 
-    # Set alloc_shape and transform_steps on input/output specs
+    # Set I/O alloc_shape based on per-tensor resolved layout (not model-level heuristic)
     for spec in graph.graph_inputs:
-        padded = padded_shape_4d(spec.shape)
-        spec.alloc_shape = padded if padded != spec.shape else None
+        resolved = tensor_layouts.get(spec.name)
+        if resolved and resolved.needs_padding:
+            spec.alloc_shape = resolved.physical_shape
+        else:
+            spec.alloc_shape = None
         spec.transform_steps = _build_io_transforms(spec, compute_dtype)
     for spec in graph.graph_outputs:
-        padded = padded_shape_4d(spec.shape)
-        spec.alloc_shape = padded if padded != spec.shape else None
+        resolved = tensor_layouts.get(spec.name)
+        if resolved and resolved.needs_padding:
+            spec.alloc_shape = resolved.physical_shape
+        else:
+            spec.alloc_shape = None
         spec.transform_steps = _build_io_transforms(spec, compute_dtype)
 
     return ExecutionPlan(
@@ -373,10 +409,10 @@ def generate_execution_plan(graph: IRGraph) -> ExecutionPlan:
 def _find_buffer_shape(name: str, fusion_result, graph: IRGraph) -> list[int] | None:
     for item in fusion_result:
         if isinstance(item, FusedGroup):
-            last_node = item.nodes[-1]
-            for out in last_node.outputs:
-                if out.name == name:
-                    return out.shape
+            for node in item.nodes:
+                for out in node.outputs:
+                    if out.name == name:
+                        return out.shape
         elif isinstance(item, OpNode):
             for out in item.outputs:
                 if out.name == name:
@@ -422,8 +458,9 @@ def _gen_add_relu_kernel(group: FusedGroup, graph: IRGraph) -> KernelCall:
 def _gen_conv_fused_kernel(group: FusedGroup, graph: IRGraph) -> KernelCall:
     first_node = group.nodes[0]
     last_node = group.nodes[-1]
-    return _gen_conv_kernel(first_node, graph, has_relu="relu" in group.kernel_type,
-                            output_name=last_node.outputs[0].name)
+    return _gen_conv_kernel(
+        first_node, graph, has_relu="relu" in group.kernel_type, output_name=last_node.outputs[0].name
+    )
 
 
 def _generate_fused_kernel_call(group: FusedGroup, graph: IRGraph) -> KernelCall | None:
@@ -459,12 +496,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             scalar = float(node.attrs.get("other", 0.0))
             total = int(np.prod(out_shape))
             return KernelCall(
-                kernel_name="eltwise_add_scalar_kernel", kernel_source="elementwise_extended.metal",
+                kernel_name="eltwise_add_scalar_kernel",
+                kernel_source="elementwise_extended.metal",
                 input_buffers=[node.inputs[0].name],
                 output_buffers=[node.outputs[0].name],
                 param_buffers=["scalar_params"],
                 params={"scalar": scalar, "total": total},
-                dispatch_type="1d", total_threads=total,
+                dispatch_type="1d",
+                total_threads=total,
             )
         return _gen_binary_op(node, "aten.add.Tensor")
 
@@ -487,17 +526,22 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             strides_in = _compute_strides(in_shape)
             strides_out = _compute_strides(out_shape)
             return KernelCall(
-                kernel_name="transpose_kernel", kernel_source="tensor_ops.metal",
+                kernel_name="transpose_kernel",
+                kernel_source="tensor_ops.metal",
                 input_buffers=[node.inputs[0].name],
                 output_buffers=[node.outputs[0].name],
                 param_buffers=["transpose_params"],
                 params={
-                    "ndim": ndim, "dim0": 0, "dim1": 1, "total": total,
+                    "ndim": ndim,
+                    "dim0": 0,
+                    "dim1": 1,
+                    "total": total,
                     "shape": list(in_shape) + [0] * (_MAX_NDIM - ndim),
                     "strides_in": strides_in + [0] * (_MAX_NDIM - ndim),
                     "strides_out": strides_out + [0] * (_MAX_NDIM - ndim),
                 },
-                dispatch_type="1d", total_threads=total,
+                dispatch_type="1d",
+                total_threads=total,
             )
         return None
 
@@ -526,8 +570,11 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
                 output_buffers=[node.outputs[0].name],
                 param_buffers=["depad_4d_params"],
                 params={
-                    "batch": N, "channels": C, "channels_aligned": C_aligned,
-                    "height": H, "width": W,
+                    "batch": N,
+                    "channels": C,
+                    "channels_aligned": C_aligned,
+                    "height": H,
+                    "width": W,
                 },
                 dispatch_type="1d",
                 total_threads=total,
@@ -561,11 +608,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
     if node.op_type in _UNARY_OPS:
         total = int(np.prod(node.outputs[0].shape))
         return KernelCall(
-            kernel_name=_UNARY_OPS[node.op_type], kernel_source="elementwise_extended.metal",
+            kernel_name=_UNARY_OPS[node.op_type],
+            kernel_source="elementwise_extended.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
-            param_buffers=[], params={},
-            dispatch_type="1d", total_threads=total,
+            param_buffers=[],
+            params={},
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     if node.op_type in _BINARY_OPS:
@@ -574,12 +624,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             scalar = float(node.attrs.get("other", 1.0))
             total = int(np.prod(node.outputs[0].shape))
             return KernelCall(
-                kernel_name="eltwise_mul_scalar_kernel", kernel_source="elementwise_extended.metal",
+                kernel_name="eltwise_mul_scalar_kernel",
+                kernel_source="elementwise_extended.metal",
                 input_buffers=[node.inputs[0].name],
                 output_buffers=[node.outputs[0].name],
                 param_buffers=["scalar_params"],
                 params={"scalar": scalar, "total": total},
-                dispatch_type="1d", total_threads=total,
+                dispatch_type="1d",
+                total_threads=total,
             )
         return _gen_binary_op(node, node.op_type)
 
@@ -589,28 +641,34 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         total = int(np.prod(node.outputs[0].shape))
         exponent = float(node.attrs.get("exponent", 2.0))
         return KernelCall(
-            kernel_name="pow_scalar_kernel", kernel_source="elementwise_extended.metal",
+            kernel_name="pow_scalar_kernel",
+            kernel_source="elementwise_extended.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
-            param_buffers=["pow_params"], params={"exponent": exponent},
-            dispatch_type="1d", total_threads=total,
+            param_buffers=["pow_params"],
+            params={"exponent": exponent},
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── Embedding ──
 
     if node.op_type == "aten.embedding.default":
-        weight = node.inputs[0]   # (vocab_size, embed_dim)
+        weight = node.inputs[0]  # (vocab_size, embed_dim)
         indices = node.inputs[1]  # (seq_len,) or (batch, seq_len)
         out_shape = node.outputs[0].shape
         vocab_size, embed_dim = weight.shape[0], weight.shape[1]
         seq_len = int(np.prod(indices.shape))
         return KernelCall(
-            kernel_name="embedding_kernel", kernel_source="embedding.metal",
+            kernel_name="embedding_kernel",
+            kernel_source="embedding.metal",
             input_buffers=[indices.name, weight.name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["embedding_params"],
             params={"seq_len": seq_len, "embed_dim": embed_dim, "vocab_size": vocab_size},
-            dispatch_type="2d", grid_width=embed_dim, grid_height=seq_len,
+            dispatch_type="2d",
+            grid_width=embed_dim,
+            grid_height=seq_len,
         )
 
     # ── Zero-cost shape ops ──
@@ -618,12 +676,17 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
     # Emitting them as _reshape avoids GPU dispatch entirely — the executor
     # just creates a new NPUBuffer pointing to the same Metal buffer.
 
-    if node.op_type in ("aten.contiguous.default", "aten.unsqueeze.default",
-                         "aten.alias.default", "aten.detach_.default"):
+    if node.op_type in (
+        "aten.contiguous.default",
+        "aten.unsqueeze.default",
+        "aten.alias.default",
+        "aten.detach_.default",
+    ):
         in_shape = node.inputs[0].shape
         out_shape = node.outputs[0].shape
         return KernelCall(
-            kernel_name="_reshape", kernel_source="",
+            kernel_name="_reshape",
+            kernel_source="",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=[],
@@ -644,12 +707,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         cols = shape[dim]
         rows = int(np.prod(shape)) // cols
         return KernelCall(
-            kernel_name="softmax_kernel", kernel_source="softmax.metal",
+            kernel_name="softmax_kernel",
+            kernel_source="softmax.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["softmax_params"],
             params={"rows": rows, "cols": cols},
-            dispatch_type="1d", total_threads=rows,
+            dispatch_type="1d",
+            total_threads=rows,
         )
 
     # ── Mean (last dim reduction) ──
@@ -663,12 +728,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             cols = in_shape[-1]
             rows = int(np.prod(in_shape[:-1]))
             return KernelCall(
-                kernel_name="mean_last_dim_kernel", kernel_source="elementwise_extended.metal",
+                kernel_name="mean_last_dim_kernel",
+                kernel_source="elementwise_extended.metal",
                 input_buffers=[node.inputs[0].name],
                 output_buffers=[node.outputs[0].name],
                 param_buffers=["reduce_params"],
                 params={"rows": rows, "cols": cols},
-                dispatch_type="1d", total_threads=rows,
+                dispatch_type="1d",
+                total_threads=rows,
             )
         # Fallback: 4D adaptive avg pool style (for ResNet mean over spatial dims)
         if len(in_shape) == 4:
@@ -686,22 +753,41 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         out_shape = node.outputs[0].shape
         dim0 = node.attrs.get("dim0", 0)
         dim1 = node.attrs.get("dim1", 1)
+
+        # Optimization: when either transposed dimension has size 1,
+        # the data layout is unchanged — emit a zero-cost alias instead.
+        if in_shape[dim0] == 1 or in_shape[dim1] == 1:
+            return KernelCall(
+                kernel_name="_reshape",
+                kernel_source="",
+                input_buffers=[node.inputs[0].name],
+                output_buffers=[node.outputs[0].name],
+                param_buffers=[],
+                params={"input_shape": list(in_shape), "output_shape": list(out_shape)},
+                dispatch_type="none",
+            )
+
         ndim = len(in_shape)
         total = int(np.prod(out_shape))
         strides_in = _compute_strides(in_shape)
         strides_out = _compute_strides(out_shape)
         return KernelCall(
-            kernel_name="transpose_kernel", kernel_source="tensor_ops.metal",
+            kernel_name="transpose_kernel",
+            kernel_source="tensor_ops.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["transpose_params"],
             params={
-                "ndim": ndim, "dim0": dim0, "dim1": dim1, "total": total,
+                "ndim": ndim,
+                "dim0": dim0,
+                "dim1": dim1,
+                "total": total,
                 "shape": list(in_shape) + [0] * (_MAX_NDIM - ndim),
                 "strides_in": strides_in + [0] * (_MAX_NDIM - ndim),
                 "strides_out": strides_out + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── Cat (concatenation) ──
@@ -711,7 +797,8 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         # Alias avoids dispatching a kernel for a no-op concatenation.
         if node.inputs[0].shape == [0]:
             return KernelCall(
-                kernel_name="_reshape", kernel_source="",
+                kernel_name="_reshape",
+                kernel_source="",
                 input_buffers=[node.inputs[1].name],
                 output_buffers=[node.outputs[0].name],
                 param_buffers=[],
@@ -728,17 +815,21 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         in1_axis_size = node.inputs[0].shape[axis]
         strides = _compute_strides(out_shape)
         return KernelCall(
-            kernel_name="cat_2_kernel", kernel_source="tensor_ops.metal",
+            kernel_name="cat_2_kernel",
+            kernel_source="tensor_ops.metal",
             input_buffers=[node.inputs[0].name, node.inputs[1].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["cat_params"],
             params={
-                "axis": axis, "ndim": ndim, "total": total,
+                "axis": axis,
+                "ndim": ndim,
+                "total": total,
                 "in1_axis_size": in1_axis_size,
                 "out_shape": list(out_shape) + [0] * (_MAX_NDIM - ndim),
                 "strides": strides + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── Slice ──
@@ -758,17 +849,23 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         total = int(np.prod(out_shape))
         in_strides = _compute_strides(in_shape)
         return KernelCall(
-            kernel_name="slice_kernel", kernel_source="tensor_ops.metal",
+            kernel_name="slice_kernel",
+            kernel_source="tensor_ops.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["slice_params"],
             params={
-                "dim": dim, "start": start, "end": end, "step": step,
-                "ndim": ndim, "total": total,
+                "dim": dim,
+                "start": start,
+                "end": end,
+                "step": step,
+                "ndim": ndim,
+                "total": total,
                 "in_shape": list(in_shape) + [0] * (_MAX_NDIM - ndim),
                 "in_strides": in_strides + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── Expand (broadcast copy) ──
@@ -789,17 +886,20 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             if padded_in[i] == 1 and out_shape[i] != 1:
                 padded_strides[i] = 0
         return KernelCall(
-            kernel_name="expand_kernel", kernel_source="tensor_ops.metal",
+            kernel_name="expand_kernel",
+            kernel_source="tensor_ops.metal",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["expand_params"],
             params={
-                "ndim": ndim, "total": total,
+                "ndim": ndim,
+                "total": total,
                 "in_shape": padded_in + [0] * (_MAX_NDIM - ndim),
                 "out_shape": list(out_shape) + [0] * (_MAX_NDIM - ndim),
                 "in_strides": padded_strides + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── Full (constant tensor) ──
@@ -810,12 +910,14 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         fill_value = float(node.attrs.get("fill_value", 0.0))
         total = int(np.prod(out_shape))
         return KernelCall(
-            kernel_name="add_scalar_kernel", kernel_source="elementwise_extended.metal",
+            kernel_name="add_scalar_kernel",
+            kernel_source="elementwise_extended.metal",
             input_buffers=[],  # no input needed, we'll create a zero buffer
             output_buffers=[node.outputs[0].name],
             param_buffers=["scalar_params"],
             params={"scalar": fill_value, "total": total},
-            dispatch_type="1d", total_threads=total,
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── No-op: assertions and dropout (eval mode) ──
@@ -830,7 +932,8 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         in_shape = node.inputs[0].shape
         out_shape = node.outputs[0].shape
         return KernelCall(
-            kernel_name="_reshape", kernel_source="",
+            kernel_name="_reshape",
+            kernel_source="",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=[],
@@ -847,7 +950,8 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         in_shape = node.inputs[0].shape
         out_shape = node.outputs[0].shape
         return KernelCall(
-            kernel_name="_reshape", kernel_source="",
+            kernel_name="_reshape",
+            kernel_source="",
             input_buffers=[node.inputs[0].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=[],
@@ -864,7 +968,8 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         in_name = node.inputs[idx].name if idx < len(node.inputs) else node.inputs[0].name
         out_shape = node.outputs[0].shape
         return KernelCall(
-            kernel_name="_reshape", kernel_source="",
+            kernel_name="_reshape",
+            kernel_source="",
             input_buffers=[in_name],
             output_buffers=[node.outputs[0].name],
             param_buffers=[],
@@ -887,7 +992,7 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
 
         outer = int(np.prod(in_shape[:dim])) if dim > 0 else 1
         dim_size = in_shape[dim]
-        inner = int(np.prod(in_shape[dim + 1:])) if dim + 1 < ndim else 1
+        inner = int(np.prod(in_shape[dim + 1 :])) if dim + 1 < ndim else 1
         num_indices = source_shape[dim]
         total = int(np.prod(in_shape))
 
@@ -898,9 +1003,9 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
             input_buffers=[node.inputs[0].name, node.inputs[2].name, node.inputs[1].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["index_copy_params"],
-            params={"outer_size": outer, "dim_size": dim_size,
-                    "inner_size": inner, "num_indices": num_indices},
-            dispatch_type="1d", total_threads=total,
+            params={"outer_size": outer, "dim_size": dim_size, "inner_size": inner, "num_indices": num_indices},
+            dispatch_type="1d",
+            total_threads=total,
         )
 
     # ── RoPE (Rotary Position Embedding) ──
@@ -920,13 +1025,15 @@ def _generate_single_kernel_call(node: OpNode, graph: IRGraph) -> KernelCall | N
         head_dim = out_shape[-1]
 
         return KernelCall(
-            kernel_name="rope_kernel", kernel_source="rope.metal",
+            kernel_name="rope_kernel",
+            kernel_source="rope.metal",
             input_buffers=[inv_freq.name, positions.name],
             output_buffers=[node.outputs[0].name, node.outputs[1].name],
             param_buffers=["rope_params"],
             params={"seq_len": seq_len, "head_dim": head_dim},
             dispatch_type="2d",
-            grid_width=head_dim, grid_height=seq_len,
+            grid_width=head_dim,
+            grid_height=seq_len,
         )
 
     return None
@@ -975,7 +1082,8 @@ def _gen_rmsnorm_kernel(group: FusedGroup, graph: IRGraph | None = None) -> Kern
         output_buffers=[last_node.outputs[0].name],
         param_buffers=["rmsnorm_params"],
         params={"rows": rows, "cols": cols, "eps": eps},
-        dispatch_type="1d", total_threads=rows,
+        dispatch_type="1d",
+        total_threads=rows,
     )
 
 
@@ -1001,8 +1109,10 @@ def _gen_silu_mul_kernel(group: FusedGroup, graph: IRGraph | None = None) -> Ker
         kernel_source="elementwise_extended.metal",
         input_buffers=[gate_name, up_name],
         output_buffers=[mul_node.outputs[0].name],
-        param_buffers=[], params={},
-        dispatch_type="1d", total_threads=total,
+        param_buffers=[],
+        params={},
+        dispatch_type="1d",
+        total_threads=total,
     )
 
 
@@ -1035,11 +1145,14 @@ def _gen_masked_softmax_kernel(group: FusedGroup, graph: IRGraph | None = None) 
             output_buffers=[softmax_node.outputs[0].name],
             param_buffers=["masked_softmax_broadcast_params"],
             params={
-                "rows": rows, "cols": cols, "ndim": ndim,
+                "rows": rows,
+                "cols": cols,
+                "ndim": ndim,
                 "mask_strides": mask_strides + [0] * (_MAX_NDIM - ndim),
                 "out_shape": list(out_shape) + [0] * (_MAX_NDIM - ndim),
             },
-            dispatch_type="1d", total_threads=rows,
+            dispatch_type="1d",
+            total_threads=rows,
         )
     else:
         return KernelCall(
@@ -1049,12 +1162,17 @@ def _gen_masked_softmax_kernel(group: FusedGroup, graph: IRGraph | None = None) 
             output_buffers=[softmax_node.outputs[0].name],
             param_buffers=["masked_softmax_params"],
             params={"rows": rows, "cols": cols},
-            dispatch_type="1d", total_threads=rows,
+            dispatch_type="1d",
+            total_threads=rows,
         )
 
 
 def _gen_fused_decode_attention_kernel(group: FusedGroup, graph: IRGraph | None = None) -> KernelCall:
-    """Generate fused decode attention kernel from transpose→matmul→scale→add→softmax→matmul chain."""
+    """Generate fused decode attention kernel from transpose→matmul→scale→add→softmax→matmul chain.
+
+    Supports GQA: when gqa_ratio > 1, K/V are (B*Hkv, S, D) and the kernel maps
+    each Q head to its KV head internally, eliminating the expand operation.
+    """
     meta = group.metadata
     q_name = meta["q_name"]
     k_notrans_name = meta["k_notrans_name"]
@@ -1062,6 +1180,7 @@ def _gen_fused_decode_attention_kernel(group: FusedGroup, graph: IRGraph | None 
     mask_name = meta["mask_name"]
     scale = float(meta["scale"])
     B, H, S, D = meta["B"], meta["H"], meta["S"], meta["D"]
+    gqa_ratio = meta.get("gqa_ratio", 1)
     final_output_name = meta["final_output_name"]
 
     return KernelCall(
@@ -1070,9 +1189,29 @@ def _gen_fused_decode_attention_kernel(group: FusedGroup, graph: IRGraph | None 
         input_buffers=[q_name, k_notrans_name, v_name, mask_name, "cache_position"],
         output_buffers=[final_output_name],
         param_buffers=["fused_decode_attn_params"],
-        params={"batch_heads": B * H, "head_dim": D, "max_seq_len": S, "scale": scale},
+        params={"batch_heads": B * H, "head_dim": D, "max_seq_len": S, "scale": scale, "gqa_ratio": gqa_ratio},
         dispatch_type="1d",
         total_threads=B * H,
+    )
+
+
+def _gen_rope_rotate_kernel(group: FusedGroup, graph: IRGraph | None = None) -> KernelCall:
+    """Generate fused RoPE rotation kernel: output = x*cos + rotate_half(x)*sin."""
+    meta = group.metadata
+    shape = meta["shape"]  # (B, H, S, D)
+    total = 1
+    for s in shape:
+        total *= s
+    seq_len = shape[2] if len(shape) >= 4 else 1
+    return KernelCall(
+        kernel_name="rope_rotate_kernel",
+        kernel_source="rope_rotate.metal",
+        input_buffers=[meta["x_name"], meta["cos_name"], meta["sin_name"]],
+        output_buffers=[meta["output_name"]],
+        param_buffers=["rope_rotate_params"],
+        params={"total_elements": total, "head_dim": meta["head_dim"], "seq_len": seq_len},
+        dispatch_type="1d",
+        total_threads=total,
     )
 
 
@@ -1085,11 +1224,11 @@ register_fused_codegen("add_relu", _gen_add_relu_kernel)
 register_fused_codegen("rmsnorm", _gen_rmsnorm_kernel)
 register_fused_codegen("silu_mul", _gen_silu_mul_kernel)
 register_fused_codegen("masked_softmax", _gen_masked_softmax_kernel)
+register_fused_codegen("rope_rotate", _gen_rope_rotate_kernel)
 register_fused_codegen("decode_attention", _gen_fused_decode_attention_kernel)
 
 
-def _gen_conv_kernel(node: OpNode, graph: IRGraph, has_relu: bool,
-                     output_name: str | None = None) -> KernelCall:
+def _gen_conv_kernel(node: OpNode, graph: IRGraph, has_relu: bool, output_name: str | None = None) -> KernelCall:
     inp = node.inputs[0]
     weight = node.inputs[1]
     has_bias = len(node.inputs) > 2
@@ -1118,12 +1257,21 @@ def _gen_conv_kernel(node: OpNode, graph: IRGraph, has_relu: bool,
         output_buffers=[out_name],
         param_buffers=["conv_params"],
         params={
-            "batch": N, "in_channels": C_in, "in_h": H, "in_w": W,
-            "out_channels": C_out, "out_h": out_h, "out_w": out_w,
-            "kernel_h": KH, "kernel_w": KW,
-            "stride_h": stride[0], "stride_w": stride[1],
-            "pad_h": padding[0], "pad_w": padding[1],
-            "has_bias": 1 if has_bias else 0, "has_bn": 0,
+            "batch": N,
+            "in_channels": C_in,
+            "in_h": H,
+            "in_w": W,
+            "out_channels": C_out,
+            "out_h": out_h,
+            "out_w": out_w,
+            "kernel_h": KH,
+            "kernel_w": KW,
+            "stride_h": stride[0],
+            "stride_w": stride[1],
+            "pad_h": padding[0],
+            "pad_w": padding[1],
+            "has_bias": 1 if has_bias else 0,
+            "has_bn": 0,
             "has_relu": 1 if has_relu else 0,
             "groups": groups,
             "in_channels_aligned": pad_channels(C_in),
@@ -1134,8 +1282,7 @@ def _gen_conv_kernel(node: OpNode, graph: IRGraph, has_relu: bool,
     )
 
 
-def _gen_linear_kernel(node: OpNode, graph: IRGraph,
-                       output_name: str | None = None) -> KernelCall:
+def _gen_linear_kernel(node: OpNode, graph: IRGraph, output_name: str | None = None) -> KernelCall:
     inp = node.inputs[0]
     weight = node.inputs[1]
     has_bias = len(node.inputs) > 2
@@ -1169,7 +1316,9 @@ def _gen_linear_kernel(node: OpNode, graph: IRGraph,
         output_buffers=[out_name],
         param_buffers=["matmul_params"],
         params={
-            "M": M, "N": N, "K": K,
+            "M": M,
+            "N": N,
+            "K": K,
             "has_bias": 1 if has_bias else 0,
         },
         dispatch_type="2d",
@@ -1197,10 +1346,16 @@ def _gen_max_pool_kernel(node: OpNode) -> KernelCall:
         output_buffers=[node.outputs[0].name],
         param_buffers=["pool_params"],
         params={
-            "batch": N, "channels": C, "in_h": H, "in_w": W,
-            "out_h": out_h, "out_w": out_w,
-            "kernel_h": kernel_size[0], "kernel_w": kernel_size[1],
-            "stride_h": stride[0], "stride_w": stride[1],
+            "batch": N,
+            "channels": C,
+            "in_h": H,
+            "in_w": W,
+            "out_h": out_h,
+            "out_w": out_w,
+            "kernel_h": kernel_size[0],
+            "kernel_w": kernel_size[1],
+            "stride_h": stride[0],
+            "stride_w": stride[1],
             "pad_h": padding[0] if isinstance(padding, list) else padding,
             "pad_w": padding[1] if isinstance(padding, list) else padding,
             "channels_aligned": pad_channels(C),
@@ -1225,11 +1380,18 @@ def _gen_adaptive_avg_pool_kernel(node: OpNode) -> KernelCall:
         output_buffers=[node.outputs[0].name],
         param_buffers=["pool_params"],
         params={
-            "batch": N, "channels": C, "in_h": H, "in_w": W,
-            "out_h": out_h, "out_w": out_w,
-            "kernel_h": 0, "kernel_w": 0,
-            "stride_h": 0, "stride_w": 0,
-            "pad_h": 0, "pad_w": 0,
+            "batch": N,
+            "channels": C,
+            "in_h": H,
+            "in_w": W,
+            "out_h": out_h,
+            "out_w": out_w,
+            "kernel_h": 0,
+            "kernel_w": 0,
+            "stride_h": 0,
+            "stride_w": 0,
+            "pad_h": 0,
+            "pad_w": 0,
             "channels_aligned": pad_channels(C),
         },
         dispatch_type="1d",
@@ -1253,13 +1415,16 @@ def _gen_matmul_kernel(node: OpNode, graph: IRGraph) -> KernelCall:
         K = a_shape[-1]
         N = b_shape[-1]
         return KernelCall(
-            kernel_name="batched_matmul_kernel", kernel_source="matmul.metal",
+            kernel_name="batched_matmul_kernel",
+            kernel_source="matmul.metal",
             input_buffers=[node.inputs[0].name, node.inputs[1].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["batched_matmul_params"],
             params={"batch": batch, "M": M, "N": N, "K": K},
             dispatch_type="3d",
-            grid_width=N, grid_height=M, grid_depth=batch,
+            grid_width=N,
+            grid_height=M,
+            grid_depth=batch,
         )
 
     # 2D matmul: A(M,K) @ B(K,N) → C(M,N) — B is NOT transposed
@@ -1269,7 +1434,8 @@ def _gen_matmul_kernel(node: OpNode, graph: IRGraph) -> KernelCall:
 
     if M == 1:
         return KernelCall(
-            kernel_name="matmul_notrans_vec_kernel", kernel_source="matmul.metal",
+            kernel_name="matmul_notrans_vec_kernel",
+            kernel_source="matmul.metal",
             input_buffers=[node.inputs[0].name, node.inputs[1].name],
             output_buffers=[node.outputs[0].name],
             param_buffers=["matmul_params"],
@@ -1279,13 +1445,15 @@ def _gen_matmul_kernel(node: OpNode, graph: IRGraph) -> KernelCall:
         )
 
     return KernelCall(
-        kernel_name="matmul_notrans_kernel", kernel_source="matmul.metal",
+        kernel_name="matmul_notrans_kernel",
+        kernel_source="matmul.metal",
         input_buffers=[node.inputs[0].name, node.inputs[1].name],
         output_buffers=[node.outputs[0].name],
         param_buffers=["matmul_params"],
         params={"M": M, "N": N, "K": K, "has_bias": 0},
         dispatch_type="2d",
-        grid_width=N, grid_height=M,
+        grid_width=N,
+        grid_height=M,
     )
 
 
@@ -1300,13 +1468,15 @@ def _gen_addmm_kernel(node: OpNode, graph: IRGraph) -> KernelCall:
     N = weight.shape[0]
 
     return KernelCall(
-        kernel_name="matmul_kernel", kernel_source="matmul.metal",
+        kernel_name="matmul_kernel",
+        kernel_source="matmul.metal",
         input_buffers=[inp.name, weight.name, bias.name],
         output_buffers=[node.outputs[0].name],
         param_buffers=["matmul_params"],
         params={"M": M, "N": N, "K": K, "has_bias": 1},
         dispatch_type="2d",
-        grid_width=N, grid_height=M,
+        grid_width=N,
+        grid_height=M,
     )
 
 
@@ -1318,7 +1488,7 @@ HANDLED_OPS: set[str] = {
     "aten.conv2d.default",
     "aten.relu.default",
     "aten.relu_.default",
-    "aten.batch_norm.default",     # consumed by graph_optimizer (BN folding), not codegen
+    "aten.batch_norm.default",  # consumed by graph_optimizer (BN folding), not codegen
     "aten.add.Tensor",
     "aten.add_.Tensor",
     "aten.max_pool2d.default",

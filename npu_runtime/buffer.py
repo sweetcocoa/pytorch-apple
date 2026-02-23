@@ -154,6 +154,42 @@ class NPUBuffer(DeviceBuffer):
 
         return NPUBuffer(mtl_buffer, logical_shape, dtype, device, final_alloc_shape)
 
+    def write_from_numpy(self, data: np.ndarray, spec: TensorSpec | None = None) -> None:
+        """Write numpy data into existing Metal buffer in-place (no allocation).
+
+        Args:
+            data: Input numpy array.
+            spec: TensorSpec with transform_steps. If provided, transforms are applied.
+        """
+        if spec is not None and spec.transform_steps:
+            result = data
+            for step in spec.transform_steps:
+                if step["type"] == "cast":
+                    target = _DTYPE_MAP[step["to"]]
+                    if result.dtype != target:
+                        result = result.astype(target)
+                elif step["type"] == "pad":
+                    alloc_shape = tuple(step["alloc_shape"])
+                    result = _pad_to_alloc_shape(result, alloc_shape)
+            converted = result
+        else:
+            if np.issubdtype(data.dtype, np.integer):
+                converted = data.astype(np.int32) if data.dtype != np.int32 else data
+            elif data.dtype == ml_dtypes.bfloat16:
+                converted = data
+            else:
+                converted = data.astype(np.float16) if data.dtype != np.float16 else data
+
+            if self._alloc_shape != tuple(converted.shape):
+                converted = _pad_to_alloc_shape(converted, self._alloc_shape)
+
+        contiguous = np.ascontiguousarray(converted)
+        raw = contiguous.tobytes()
+        buf = self._buffer.contents().as_buffer(len(raw))
+        buf[:] = raw
+        self._shape = tuple(data.shape)
+        self._dtype = contiguous.dtype
+
     def to_numpy(self, dtype: np.dtype = np.dtype(np.float32), spec: TensorSpec | None = None) -> np.ndarray:
         """Read buffer contents back as numpy array. Default output is FP32.
 

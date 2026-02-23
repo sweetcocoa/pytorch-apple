@@ -284,7 +284,8 @@ class TestQwenDAGExecutor:
         )
 
         # 6. Compare logits
-        npu_logits = list(result.values())[0]
+        npu_logits_raw = list(result.values())[0]
+        npu_logits = npu_logits_raw.to_numpy() if hasattr(npu_logits_raw, "to_numpy") else npu_logits_raw
 
         for pos in range(actual_len):
             cpu_top5 = set(np.argsort(cpu_logits[0, pos])[-5:])

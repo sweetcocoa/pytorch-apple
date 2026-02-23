@@ -5,6 +5,9 @@ from npu_compiler.fusion_patterns import find_fusion_groups as find_fusion_group
 from npu_compiler.graph_optimizer import eliminate_noop_ops, fold_batch_norms
 from npu_compiler.ir_reader import IRGraph, load_ir
 from npu_compiler.ir_reader import load_ir_from_dict as load_ir_from_dict
+from npu_compiler.layout import CPU_PROFILE as CPU_PROFILE
+from npu_compiler.layout import METAL_PROFILE as METAL_PROFILE
+from npu_compiler.layout import LayoutProfile as LayoutProfile
 from npu_compiler.op_support import get_supported_ops as get_supported_ops
 from npu_compiler.op_support import is_op_supported as is_op_supported
 from npu_compiler.partitioner import Partition as Partition
@@ -15,21 +18,28 @@ from npu_compiler.target_config import METAL_GPU as METAL_GPU
 from npu_compiler.target_config import TargetConfig as TargetConfig
 
 
-def compile(ir: str | dict) -> CompiledProgram:
+def compile(ir: str | dict, profile: LayoutProfile | None = None) -> CompiledProgram:
     """Compile an IR to a CompiledProgram.
 
     Args:
         ir: Either a path to an IR JSON file (str) or an in-memory IR dict.
+        profile: Optional layout profile for backend-specific layout overrides.
+                 Defaults to METAL_PROFILE (PADDED_NCHW for conv/pool ops).
     """
     if isinstance(ir, str):
         graph = load_ir(ir)
     else:
         graph = load_ir_from_dict(ir)
-    return compile_graph(graph)
+    return compile_graph(graph, profile=profile)
 
 
-def compile_graph(graph: IRGraph) -> CompiledProgram:
-    """Compile an IRGraph to a CompiledProgram."""
+def compile_graph(graph: IRGraph, profile: LayoutProfile | None = None) -> CompiledProgram:
+    """Compile an IRGraph to a CompiledProgram.
+
+    Args:
+        graph: The IR graph to compile.
+        profile: Optional layout profile for backend-specific layout overrides.
+    """
     # 1. Eliminate no-op nodes (before constraint check)
     eliminate_noop_ops(graph)
 
@@ -42,8 +52,8 @@ def compile_graph(graph: IRGraph) -> CompiledProgram:
     # 3. BN folding
     bn_result = fold_batch_norms(graph)
 
-    # 4. Generate execution plan (includes fusion)
-    plan = generate_execution_plan(bn_result.graph)
+    # 4. Generate execution plan (includes fusion + layout resolution)
+    plan = generate_execution_plan(bn_result.graph, profile=profile)
 
     return CompiledProgram(
         model_name=graph.model_name,
