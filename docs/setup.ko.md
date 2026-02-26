@@ -2,7 +2,14 @@
 
 ## 요구사항
 
+### Metal 백엔드 (macOS)
 - Apple Silicon (M1/M2/M3/M4) macOS
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) 패키지 매니저
+
+### CUDA 백엔드 (Linux/Windows)
+- NVIDIA GPU (Compute Capability 7.0+, 예: RTX 3090, A100)
+- CUDA Driver 12.x
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) 패키지 매니저
 
@@ -13,8 +20,11 @@
 git clone <repo-url>
 cd npu-simulation/pytorch-apple
 
-# 런타임 의존성 설치
+# 런타임 의존성 설치 (Metal 백엔드)
 uv sync
+
+# CUDA 백엔드 의존성 설치
+uv sync --extra cuda
 
 # 개발 의존성 설치 (테스트용)
 uv sync --extra dev
@@ -49,15 +59,26 @@ pytorch-apple/
 │   ├── cpu_fallback.py     # torch_ir 기반 CPU fallback
 │   ├── weight_loader.py    # safetensors → NPU 버퍼
 │   └── profiler.py         # 커널 시간 측정
-├── metal_kernels/          # Metal 컴퓨트 셰이더
-├── tests/                  # 테스트 스위트
-├── examples/               # 데모 스크립트
-└── docs/                   # 이 문서
+├── cuda_compiler/             # CUDA 오프라인 컴파일 (서브그래프 수준)
+│   ├── op_classify.py         # Op 카테고리 분류
+│   ├── op_support.py          # CUDA op 지원 테이블
+│   ├── subgraph_analyzer.py   # 퓨전 분석 (탐욕적 elementwise)
+│   ├── cuda_codegen.py        # 퓨전 CUDA 커널 코드 생성
+│   ├── cuda_templates.py      # 사전 작성 CUDA 커널 템플릿
+│   ├── cuda_program.py        # CUDAProgram 데이터 모델
+│   └── buffer_planner.py      # 중간 버퍼 할당
+├── cuda_runtime/              # CuPy 기반 CUDA 온라인 실행
+│   ├── cuda_backend.py        # CUDABackend + CUDABuffer
+│   └── cuda_executor.py       # CUDAExecutor (NVRTC + cuBLAS)
+├── metal_kernels/             # Metal 컴퓨트 셰이더
+├── tests/                     # 테스트 스위트
+├── examples/                  # 데모 스크립트
+└── docs/                      # 이 문서
 ```
 
 ## 의존성
 
-### 런타임
+### 런타임 (Metal)
 | 패키지 | 용도 |
 |--------|------|
 | `numpy` | 배열 연산 |
@@ -65,6 +86,11 @@ pytorch-apple/
 | `pyobjc-framework-Metal` | Metal API 바인딩 |
 | `pyobjc-framework-MetalPerformanceShaders` | MPS matmul |
 | `pytorch-ir` | IR 추출 + CPU fallback 실행 (torch_to_ir) |
+
+### 런타임 (CUDA)
+| 패키지 | 용도 |
+|--------|------|
+| `cupy-cuda12x` | CUDA 런타임, NVRTC JIT, cuBLAS |
 
 ### 개발
 | 패키지 | 용도 |

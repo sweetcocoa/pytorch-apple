@@ -112,3 +112,49 @@
 | `conv_bn_relu.metal` | `conv2d_kernel` | BN+ReLU 옵션 Conv2d |
 | `add_relu.metal` | `add_kernel`, `add_relu_kernel` | ReLU 옵션 덧셈 |
 | `pool.metal` | `max_pool2d_kernel`, `adaptive_avg_pool2d_kernel` | 풀링 |
+
+## CUDA 커널
+
+CUDA 백엔드는 두 가지 메커니즘으로 커널을 생성합니다:
+
+### 1. 퓨전 Elementwise 커널 (코드 생성)
+
+컴파일 시 `cuda_compiler.cuda_codegen.generate_fused_kernel()`이 생성합니다. Elementwise op 체인 (relu, silu, add, mul, div, neg, pow, rsqrt, cos, sin)이 단일 CUDA C 커널로 퓨전되고 NVRTC를 통해 JIT 컴파일됩니다.
+
+예시: `silu(gate) * up` 생성 결과:
+```cuda
+__global__ void fused_ew_0(const __half* in0, const __half* in1,
+                           __half* out0, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    __half v0 = in0[idx];
+    __half v1 = (v0 / ((__half)1.0 + hexp(-v0)));  // silu
+    __half v2 = in1[idx];
+    out0[idx] = (v1 * v2);                          // mul
+}
+```
+
+### 2. 사전 작성 템플릿 커널
+
+`cuda_compiler/cuda_templates.py`에 정의:
+
+| 템플릿 | 연산 |
+|--------|------|
+| `softmax_kernel` | 수치 안정 softmax (max, exp, sum, normalize) |
+| `mean_last_dim_kernel` | 마지막 차원 평균 리덕션 |
+| `embedding_kernel` | 토큰 임베딩 룩업 |
+| `rope_kernel` | 회전 위치 임베딩 |
+| `index_copy_kernel` | KV 캐시 위치 갱신 |
+| `conv2d_kernel` | Conv2d (직접 구현) |
+| `batch_norm_kernel` | 배치 정규화 |
+| `max_pool2d_kernel` | 최대 풀링 |
+| `adaptive_avg_pool2d_kernel` | 적응적 평균 풀링 |
+| `transpose_kernel` | N차원 전치 |
+| `cat_2_kernel` | 2입력 연결 |
+| `slice_kernel` | 텐서 슬라이싱 |
+| `expand_kernel` | 브로드캐스트 확장 |
+| `full_kernel` | 상수 채우기 |
+
+### 3. cuBLAS (CuPy 경유)
+
+BLAS 연산 (matmul, linear, bmm, conv2d)은 내부적으로 cuBLAS로 디스패치되는 `cupy.matmul()`을 사용합니다. GEMM에 커스텀 CUDA 커널이 필요하지 않습니다.

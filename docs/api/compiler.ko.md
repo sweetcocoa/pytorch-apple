@@ -50,3 +50,31 @@
     options:
       members:
         - CompiledProgram
+
+## CUDA 서브그래프 컴파일러
+
+::: cuda_compiler
+    options:
+      members:
+        - compile_subgraph
+
+::: cuda_compiler.subgraph_analyzer
+    options:
+      members:
+        - analyze_subgraph
+
+::: cuda_compiler.cuda_codegen
+    options:
+      members:
+        - generate_fused_kernel
+        - is_fusible_elementwise
+
+::: cuda_compiler.cuda_program
+    options:
+      members:
+        - CUDAProgram
+        - CUBLASStep
+        - FusedKernelStep
+        - ReductionKernelStep
+        - AliasStep
+        - SpecialKernelStep

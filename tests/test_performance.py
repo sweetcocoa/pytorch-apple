@@ -11,9 +11,16 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from npu_runtime.buffer import NPUBuffer
-from npu_runtime.device import Device
+try:
+    from npu_runtime.buffer import NPUBuffer
+    from npu_runtime.device import Device
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
 from tests.conftest import dispatch_3d, kernels_dir, make_params
+
+pytestmark = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 
 
 @pytest.fixture(scope="module")

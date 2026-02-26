@@ -214,3 +214,22 @@ Things that need attention:
 | `compile()` API may not expose `CodegenTarget` param | `__init__.py` | Needs to be wired through |
 
 The key takeaway: **compiler changes are minimal** (CodegenTarget + TargetConfig), **runtime requires 3 new files** (buffer, executor, backend). Existing Metal code remains untouched.
+
+## Concrete Example: CUDA Backend
+
+The CUDA backend has been implemented as a reference. Unlike the Metal backend (which reuses the existing op-level codegen), the CUDA backend demonstrates a **subgraph-level** approach:
+
+| Component | Files | Approach |
+|-----------|-------|----------|
+| Compiler | `cuda_compiler/` (7 files) | Subgraph analysis + greedy elementwise fusion + NVRTC JIT |
+| Runtime | `cuda_runtime/` (2 files) | CuPy-based: cuBLAS for BLAS, RawKernel for fused kernels |
+| DAGExecutor | `npu_runtime/dag_executor.py` | Extended with `compile_fn` parameter |
+
+Key design decisions:
+
+- **No channel padding**: CUDA has no 64-byte alignment constraint (unlike Metal)
+- **Greedy fusion**: Any chain of single-consumer elementwise ops with matching shapes gets fused into one kernel
+- **BLAS via CuPy**: `cp.matmul()` for GEMM, no need for custom matmul kernels
+- **Init-time JIT**: All NVRTC compilation happens in `CUDAExecutor.__init__()`
+
+See [CUDA Backend Guide](cuda-backend.md) for full details.

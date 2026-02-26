@@ -93,6 +93,36 @@ weights = load_weights("model.safetensors", prefill_program, device)
 outputs = executor.run(inputs={...}, weights=weights)
 ```
 
+## CUDA 백엔드
+
+CUDA 백엔드는 **서브그래프 수준 컴파일**을 사용합니다: elementwise 연산 체인을 단일 CUDA 커널로 퓨전하고, 무거운 연산(matmul, conv)은 cuBLAS로 디스패치합니다.
+
+### DAGExecutor 방식 (CUDA)
+```python
+import json
+from cuda_compiler import compile_subgraph
+from cuda_compiler.op_support import is_cuda_op_supported
+from npu_compiler.partitioner import partition
+from npu_runtime.dag_executor import DAGExecutor
+from cuda_runtime.cuda_backend import CUDABackend
+
+ir_dict = json.load(open("qwen_prefill_ir.json"))
+plan = partition(ir_dict, is_cuda_op_supported)
+
+backend = CUDABackend()
+dag = DAGExecutor(plan, backend, compile_fn=compile_subgraph)
+dag.load_weights(weights_dict)
+
+result = dag.execute(inputs={
+    "input_ids": input_ids_np,
+    "attention_mask": causal_mask_np,
+    "position_ids": position_ids_np,
+    "cache_position": cache_position_np,
+})
+```
+
+아키텍처 상세 및 퓨전 전략은 [CUDA 백엔드 가이드](cuda-backend.md)를 참조하세요.
+
 ## 프로파일링
 
 내장 프로파일러로 커널 성능을 측정합니다:

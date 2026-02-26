@@ -5,9 +5,17 @@ import tempfile
 
 import numpy as np
 import numpy.testing as npt
+import pytest
 
 from npu_compiler.ir_reader import TensorSpec
-from npu_runtime.buffer import NPUBuffer
+
+try:
+    from npu_runtime.buffer import NPUBuffer
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
+pytestmark = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 
 
 class TestDevice:

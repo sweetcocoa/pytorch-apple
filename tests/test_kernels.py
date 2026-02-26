@@ -4,12 +4,21 @@ import os
 
 import numpy as np
 import numpy.testing as npt
+import pytest
 import torch
 import torch.nn.functional as F
 
 from npu_compiler.constraint_checker import pad_channels
-from npu_runtime.buffer import NPUBuffer
+
+try:
+    from npu_runtime.buffer import NPUBuffer
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
 from tests.conftest import dispatch_1d, dispatch_tiled_2d, kernels_dir, make_params
+
+pytestmark = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 
 
 def _alloc_4d(shape):

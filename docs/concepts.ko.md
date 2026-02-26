@@ -119,15 +119,17 @@ safetensors 가중치를 변환 레시피와 함께 로드:
 
 - `Backend` — `create_executor()`, `allocate_buffer()`, `device` 속성을 가진 추상 기반 클래스
 - `MetalBackend` — pyobjc 기반 Metal GPU 구현
+- `CUDABackend` — CuPy 기반 NVIDIA GPU 구현 ([CUDA 백엔드](cuda-backend.md) 참조)
 - `DeviceBuffer` — `to_numpy()` / `from_numpy()`를 가진 디바이스 메모리 추상화
 
 ### DAGExecutor
 `PartitionPlan`에 따라 NPU + CPU 혼합 실행을 오케스트레이션:
 
-- NPU 파티션은 초기화 시 `npu_compiler.compile(sub_ir_dict)`로 컴파일
+- NPU 파티션은 초기화 시 `npu_compiler.compile(sub_ir_dict)` (Metal) 또는 `cuda_compiler.compile_subgraph(sub_ir_dict)` (CUDA)로 컴파일
 - CPU 파티션은 `torch_ir.IRExecutor`로 실행 (ATen fallback)
 - Transfer op이 디바이스 간 텐서 이동 (bfloat16 dtype 보존)
 - `load_weights()`로 NPU 가중치 버퍼를 사전 캐시하여 실행 간 재사용
+- `compile_fn` 파라미터로 사용할 컴파일러 선택 (Metal 또는 CUDA)
 
 ### CPU Fallback
 `execute_cpu_partition()`이 `torch_ir.IRExecutor`를 사용하여 미지원 op을 CPU에서 실행합니다. `ml_dtypes`를 통한 bfloat16 포함 numpy↔torch 텐서 변환을 처리합니다.

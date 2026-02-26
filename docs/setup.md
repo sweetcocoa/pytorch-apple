@@ -2,7 +2,14 @@
 
 ## Requirements
 
+### Metal Backend (macOS)
 - macOS with Apple Silicon (M1/M2/M3/M4)
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) package manager
+
+### CUDA Backend (Linux/Windows)
+- NVIDIA GPU (Compute Capability 7.0+, e.g. RTX 3090, A100)
+- CUDA Driver 12.x
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) package manager
 
@@ -13,8 +20,11 @@
 git clone <repo-url>
 cd npu-simulation/pytorch-apple
 
-# Install runtime dependencies
+# Install runtime dependencies (Metal backend)
 uv sync
+
+# Install CUDA backend dependencies
+uv sync --extra cuda
 
 # Install dev dependencies (for tests)
 uv sync --extra dev
@@ -49,24 +59,35 @@ pytorch-apple/
 │   ├── cpu_fallback.py     # CPU fallback via torch_ir
 │   ├── weight_loader.py    # safetensors → NPU buffers
 │   └── profiler.py         # Kernel timing measurement
-├── metal_kernels/          # Metal compute shaders
-│   ├── matmul.metal        # Tiled + vec matmul
-│   ├── conv_bn_relu.metal  # Conv2d with fusion
-│   ├── elementwise*.metal  # Element-wise ops
-│   ├── softmax.metal       # Softmax + masked softmax
-│   ├── rmsnorm.metal       # Fused RMSNorm
-│   ├── tensor_ops.metal    # Transpose, cat, slice, expand
-│   ├── embedding.metal     # Token embedding lookup
-│   ├── rope.metal          # Rotary position embedding
+├── cuda_compiler/             # CUDA offline compilation (subgraph-level)
+│   ├── op_classify.py         # Op category classification
+│   ├── op_support.py          # CUDA op support table
+│   ├── subgraph_analyzer.py   # Fusion analysis (greedy elementwise)
+│   ├── cuda_codegen.py        # Fused CUDA kernel code generation
+│   ├── cuda_templates.py      # Pre-written CUDA kernel templates
+│   ├── cuda_program.py        # CUDAProgram data model
+│   └── buffer_planner.py      # Intermediate buffer allocation
+├── cuda_runtime/              # CUDA online execution via CuPy
+│   ├── cuda_backend.py        # CUDABackend + CUDABuffer
+│   └── cuda_executor.py       # CUDAExecutor (NVRTC + cuBLAS)
+├── metal_kernels/             # Metal compute shaders
+│   ├── matmul.metal           # Tiled + vec matmul
+│   ├── conv_bn_relu.metal     # Conv2d with fusion
+│   ├── elementwise*.metal     # Element-wise ops
+│   ├── softmax.metal          # Softmax + masked softmax
+│   ├── rmsnorm.metal          # Fused RMSNorm
+│   ├── tensor_ops.metal       # Transpose, cat, slice, expand
+│   ├── embedding.metal        # Token embedding lookup
+│   ├── rope.metal             # Rotary position embedding
 │   └── ...
-├── tests/                  # Test suite
-├── examples/               # Demo scripts
-└── docs/                   # This documentation
+├── tests/                     # Test suite
+├── examples/                  # Demo scripts
+└── docs/                      # This documentation
 ```
 
 ## Dependencies
 
-### Runtime
+### Runtime (Metal)
 | Package | Purpose |
 |---------|---------|
 | `numpy` | Array operations |
@@ -74,6 +95,11 @@ pytorch-apple/
 | `pyobjc-framework-Metal` | Metal API bindings |
 | `pyobjc-framework-MetalPerformanceShaders` | MPS matmul |
 | `pytorch-ir` | IR extraction + CPU fallback execution (torch_to_ir) |
+
+### Runtime (CUDA)
+| Package | Purpose |
+|---------|---------|
+| `cupy-cuda12x` | CUDA runtime, NVRTC JIT, cuBLAS |
 
 ### Dev
 | Package | Purpose |

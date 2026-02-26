@@ -147,3 +147,37 @@ if group.kernel_type == "my_fusion":
 | `2d` | 2D ops (embedding, matmul) | `grid_width x grid_height` |
 | `3d` | Batched ops (BMM) | `grid_width x grid_height x grid_depth` |
 | `none` | Zero-cost aliases | No dispatch |
+
+## Adding Ops to the CUDA Backend
+
+The CUDA backend uses a different approach — **subgraph-level codegen** with greedy elementwise fusion.
+
+### 1. Add to `_CUDA_EXPR_MAP` (elementwise ops)
+
+For elementwise ops, add the CUDA C expression to `cuda_compiler/cuda_codegen.py`:
+
+```python
+_CUDA_EXPR_MAP["aten.my_op.default"] = "my_cuda_func({v_prev})"
+```
+
+This automatically enables the op to participate in elementwise chain fusion.
+
+### 2. Add to Op Classification
+
+In `cuda_compiler/op_classify.py`, add the op to `_OP_CATEGORY_TABLE`:
+
+```python
+"aten.my_op.default": OpCategory.ELEMENTWISE,
+```
+
+### 3. Add to Op Support Table
+
+In `cuda_compiler/op_support.py`, add to `_CUDA_SUPPORTED_OPS`:
+
+```python
+_CUDA_SUPPORTED_OPS.add("aten.my_op.default")
+```
+
+### 4. Add Kernel Template (non-elementwise ops)
+
+For reduction, special, or BLAS ops, add a CUDA kernel template to `cuda_compiler/cuda_templates.py` and handle it in `cuda_compiler/subgraph_analyzer.py`.

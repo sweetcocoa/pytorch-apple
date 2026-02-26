@@ -119,15 +119,17 @@ Hardware-agnostic interface for NPU execution:
 
 - `Backend` — abstract base class with `create_executor()`, `allocate_buffer()`, `device` property
 - `MetalBackend` — Metal GPU implementation via pyobjc
+- `CUDABackend` — NVIDIA GPU implementation via CuPy (see [CUDA Backend](cuda-backend.md))
 - `DeviceBuffer` — device memory abstraction with `to_numpy()` / `from_numpy()`
 
 ### DAGExecutor
 Orchestrates mixed NPU + CPU execution from a `PartitionPlan`:
 
-- NPU partitions compiled via `npu_compiler.compile(sub_ir_dict)` at init time
+- NPU partitions compiled via `npu_compiler.compile(sub_ir_dict)` (Metal) or `cuda_compiler.compile_subgraph(sub_ir_dict)` (CUDA) at init time
 - CPU partitions executed via `torch_ir.IRExecutor` (ATen fallback)
 - Transfer ops move tensors between devices (bfloat16 dtype preserved)
 - `load_weights()` pre-caches NPU weight buffers for reuse across runs
+- `compile_fn` parameter selects which compiler to use (Metal or CUDA)
 
 ### CPU Fallback
 `execute_cpu_partition()` runs unsupported ops on CPU using `torch_ir.IRExecutor`. Handles numpy↔torch tensor conversion including bfloat16 via `ml_dtypes`.

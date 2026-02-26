@@ -141,3 +141,37 @@ if group.kernel_type == "my_fusion":
 | `2d` | 2D 연산 (임베딩, matmul) | `grid_width x grid_height` |
 | `3d` | 배치 연산 (BMM) | `grid_width x grid_height x grid_depth` |
 | `none` | 제로 코스트 별칭 | 디스패치 없음 |
+
+## CUDA 백엔드에 Op 추가
+
+CUDA 백엔드는 다른 접근 방식을 사용합니다 -- 탐욕적 elementwise 퓨전을 가진 **서브그래프 수준 코드 생성**입니다.
+
+### 1. `_CUDA_EXPR_MAP`에 추가 (elementwise op)
+
+Elementwise op의 경우, `cuda_compiler/cuda_codegen.py`에 CUDA C 표현식을 추가합니다:
+
+```python
+_CUDA_EXPR_MAP["aten.my_op.default"] = "my_cuda_func({v_prev})"
+```
+
+이렇게 하면 해당 op이 elementwise 체인 퓨전에 자동으로 참여할 수 있습니다.
+
+### 2. Op 분류에 추가
+
+`cuda_compiler/op_classify.py`의 `_OP_CATEGORY_TABLE`에 op을 추가합니다:
+
+```python
+"aten.my_op.default": OpCategory.ELEMENTWISE,
+```
+
+### 3. Op 지원 테이블에 추가
+
+`cuda_compiler/op_support.py`의 `_CUDA_SUPPORTED_OPS`에 추가합니다:
+
+```python
+_CUDA_SUPPORTED_OPS.add("aten.my_op.default")
+```
+
+### 4. 커널 템플릿 추가 (비-elementwise op)
+
+리덕션, 특수, 또는 BLAS op의 경우, `cuda_compiler/cuda_templates.py`에 CUDA 커널 템플릿을 추가하고 `cuda_compiler/subgraph_analyzer.py`에서 처리합니다.

@@ -34,3 +34,18 @@
     options:
       members:
         - Profiler
+
+## CUDA Backend
+
+::: cuda_runtime.cuda_backend
+    options:
+      members:
+        - CUDABackend
+        - CUDABuffer
+
+## CUDA Executor
+
+::: cuda_runtime.cuda_executor
+    options:
+      members:
+        - CUDAExecutor

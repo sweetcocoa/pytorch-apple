@@ -93,6 +93,36 @@ weights = load_weights("model.safetensors", prefill_program, device)
 outputs = executor.run(inputs={...}, weights=weights)
 ```
 
+## CUDA Backend
+
+The CUDA backend uses **subgraph-level compilation**: chains of elementwise ops are fused into single CUDA kernels, while heavy compute ops (matmul, conv) are dispatched via cuBLAS.
+
+### Via DAGExecutor (CUDA)
+```python
+import json
+from cuda_compiler import compile_subgraph
+from cuda_compiler.op_support import is_cuda_op_supported
+from npu_compiler.partitioner import partition
+from npu_runtime.dag_executor import DAGExecutor
+from cuda_runtime.cuda_backend import CUDABackend
+
+ir_dict = json.load(open("qwen_prefill_ir.json"))
+plan = partition(ir_dict, is_cuda_op_supported)
+
+backend = CUDABackend()
+dag = DAGExecutor(plan, backend, compile_fn=compile_subgraph)
+dag.load_weights(weights_dict)
+
+result = dag.execute(inputs={
+    "input_ids": input_ids_np,
+    "attention_mask": causal_mask_np,
+    "position_ids": position_ids_np,
+    "cache_position": cache_position_np,
+})
+```
+
+See the [CUDA Backend Guide](cuda-backend.md) for architecture details and fusion strategy.
+
 ## Profiling
 
 Use the built-in profiler to measure kernel performance:

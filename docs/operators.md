@@ -1,6 +1,15 @@
 # Operator Support
 
-Ops listed below run on the NPU. Ops not in this list are automatically routed to CPU fallback via the [graph partition pipeline](partitioning.md).
+Ops listed below run on the NPU (Metal) or CUDA GPU. Ops not in this list are automatically routed to CPU fallback via the [graph partition pipeline](partitioning.md).
+
+Both Metal and CUDA backends support the same 50+ ops. The key difference is the execution strategy:
+
+| Aspect | Metal Backend | CUDA Backend |
+|--------|--------------|-------------|
+| Codegen level | Op-level (1 ATen op → 1 kernel) | Subgraph-level (N ops → M fused kernels) |
+| Elementwise fusion | Pattern-based (Conv+BN+ReLU, Add+ReLU) | Greedy chain fusion (any elementwise chain) |
+| BLAS dispatch | MPS MatrixMultiplication | cuBLAS via CuPy |
+| JIT compilation | Metal shader compilation | NVRTC (CUDA Runtime Compiler) |
 
 ## Supported Operations (50+)
 

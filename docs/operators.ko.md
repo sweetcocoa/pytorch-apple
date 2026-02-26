@@ -1,6 +1,15 @@
 # 연산자 지원
 
-아래 나열된 op은 NPU에서 실행됩니다. 이 목록에 없는 op은 [그래프 파티션 파이프라인](partitioning.ko.md)을 통해 CPU fallback으로 자동 라우팅됩니다.
+아래 나열된 op은 NPU (Metal) 또는 CUDA GPU에서 실행됩니다. 이 목록에 없는 op은 [그래프 파티션 파이프라인](partitioning.ko.md)을 통해 CPU fallback으로 자동 라우팅됩니다.
+
+Metal과 CUDA 백엔드 모두 동일한 50+ op을 지원합니다. 핵심 차이점은 실행 전략입니다:
+
+| 측면 | Metal 백엔드 | CUDA 백엔드 |
+|------|-------------|-------------|
+| 코드 생성 수준 | Op 수준 (1 ATen op -> 1 커널) | 서브그래프 수준 (N op -> M 퓨전 커널) |
+| Elementwise 퓨전 | 패턴 기반 (Conv+BN+ReLU, Add+ReLU) | 탐욕적 체인 퓨전 (임의 elementwise 체인) |
+| BLAS 디스패치 | MPS MatrixMultiplication | CuPy 경유 cuBLAS |
+| JIT 컴파일 | Metal 셰이더 컴파일 | NVRTC (CUDA Runtime Compiler) |
 
 ## 지원 연산 (50+)
 

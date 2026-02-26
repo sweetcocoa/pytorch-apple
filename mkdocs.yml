@@ -1,5 +1,5 @@
 site_name: "NPU Simulation"
-site_description: "NPU compiler/runtime backend on Metal GPU"
+site_description: "NPU compiler/runtime backend on Metal GPU and CUDA"
 
 theme:
   name: material
@@ -50,6 +50,7 @@ plugins:
             "Metal Kernels": "Metal 커널"
             Benchmarks: "벤치마크"
             "Backend Porting": "백엔드 포팅"
+            "CUDA Backend": "CUDA 백엔드"
       docs_structure: suffix
   - mkdocstrings:
       handlers:
@@ -83,6 +84,7 @@ nav:
     - "Extension Guide": extending.md
     - "Graph Partitioning": partitioning.md
     - "Backend Porting": backend-porting.md
+    - "CUDA Backend": cuda-backend.md
   - Benchmarks: benchmarks.md
   - "API Reference":
     - Overview: api/index.md

@@ -11,6 +11,7 @@ import tempfile
 
 import numpy as np
 import numpy.testing as npt
+import pytest
 import torch
 import torch.nn as nn
 from torch_ir import extract_ir
@@ -18,8 +19,24 @@ from torch_ir import extract_ir
 from npu_compiler.op_support import is_op_supported
 from npu_compiler.partitioner import Partition, partition
 from npu_runtime.backend import DeviceBuffer
-from npu_runtime.dag_executor import DAGExecutor
-from npu_runtime.metal_backend import MetalBackend
+
+try:
+    from npu_runtime.dag_executor import DAGExecutor
+    from npu_runtime.metal_backend import MetalBackend
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
+try:
+    import cupy  # noqa: F401
+
+    from cuda_compiler import compile_subgraph
+    from cuda_compiler.op_support import is_cuda_op_supported
+    from cuda_runtime.cuda_backend import CUDABackend
+
+    HAS_CUPY = True
+except Exception:
+    HAS_CUPY = False
 
 
 def _to_numpy(val):
@@ -102,6 +119,7 @@ class SimpleConvNet(nn.Module):
         return x
 
 
+@pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 class TestDAGExecutorAllSupported:
     """All ops supported → single NPU partition, result matches existing Executor."""
 
@@ -139,6 +157,7 @@ class TestDAGExecutorAllSupported:
         assert np.argmax(npu_output) == np.argmax(cpu_output)
 
 
+@pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 class TestDAGExecutorMixed:
     """Some ops marked as unsupported → mixed NPU + CPU execution."""
 
@@ -184,6 +203,7 @@ class TestDAGExecutorMixed:
         assert np.argmax(npu_output) == np.argmax(cpu_output)
 
 
+@pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 class TestDAGExecutorResNet:
     """E2E: ResNet-18 through DAG executor."""
 
@@ -317,3 +337,76 @@ class TestDAGExecutorResNet:
         npu_output = _to_numpy(list(result.values())[0])
         npt.assert_allclose(npu_output, cpu_output, rtol=1e-1, atol=1e-1)
         assert np.argmax(npu_output) == np.argmax(cpu_output)
+
+
+# ─── CUDA Backend DAG Executor Tests ───
+
+
+@pytest.mark.skipif(not HAS_CUPY, reason="CuPy/CUDA not available")
+class TestDAGExecutorCUDA:
+    """DAGExecutor with CUDABackend + compile_subgraph."""
+
+    def test_simple_convnet_all_cuda(self):
+        torch.manual_seed(42)
+        model = SimpleConvNet()
+        model.eval()
+
+        ir_dict = _extract_ir_dict(SimpleConvNet, (1, 3, 32, 32), "SimpleConvNet")
+        weights_np = _model_weights_numpy(model)
+
+        plan = partition(ir_dict, is_cuda_op_supported)
+        partitions = [s for s in plan.steps if isinstance(s, Partition)]
+        cuda_parts = [p for p in partitions if p.target == "npu"]
+        assert len(cuda_parts) >= 1
+
+        backend = CUDABackend()
+        dag = DAGExecutor(plan, backend, compile_fn=compile_subgraph)
+
+        input_tensor = torch.randn(1, 3, 32, 32)
+        input_name = ir_dict["graph_inputs"][0]["name"]
+        result = dag.execute(
+            inputs={input_name: input_tensor.numpy()},
+            weights=weights_np,
+        )
+
+        with torch.no_grad():
+            cpu_output = model(input_tensor).numpy()
+
+        cuda_output = _to_numpy(list(result.values())[0])
+        npt.assert_allclose(cuda_output, cpu_output, rtol=1e-1, atol=1e-1)
+        assert np.argmax(cuda_output) == np.argmax(cpu_output)
+
+    def test_mixed_cuda_cpu(self):
+        """Mark max_pool2d as unsupported → CPU fallback, rest on CUDA."""
+        torch.manual_seed(42)
+        model = SimpleConvNet()
+        model.eval()
+
+        ir_dict = _extract_ir_dict(SimpleConvNet, (1, 3, 32, 32), "SimpleConvNet")
+        weights_np = _model_weights_numpy(model)
+
+        def custom_support(op_type, attrs=None):
+            if op_type == "aten.max_pool2d.default":
+                return False
+            return is_cuda_op_supported(op_type, attrs)
+
+        plan = partition(ir_dict, custom_support)
+        cpu_parts = [s for s in plan.steps if isinstance(s, Partition) and s.target == "cpu"]
+        assert len(cpu_parts) >= 1
+
+        backend = CUDABackend()
+        dag = DAGExecutor(plan, backend, compile_fn=compile_subgraph)
+
+        input_tensor = torch.randn(1, 3, 32, 32)
+        input_name = ir_dict["graph_inputs"][0]["name"]
+        result = dag.execute(
+            inputs={input_name: input_tensor.numpy()},
+            weights=weights_np,
+        )
+
+        with torch.no_grad():
+            cpu_output = model(input_tensor).numpy()
+
+        cuda_output = _to_numpy(list(result.values())[0])
+        npt.assert_allclose(cuda_output, cpu_output, rtol=1e-1, atol=1e-1)
+        assert np.argmax(cuda_output) == np.argmax(cpu_output)

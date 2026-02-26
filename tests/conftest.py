@@ -5,14 +5,52 @@ import struct
 
 import pytest
 
-from npu_runtime.buffer import NPUBuffer
-from npu_runtime.device import Device
+try:
+    from npu_runtime.buffer import NPUBuffer
+    from npu_runtime.device import Device
+    from npu_runtime.metal_backend import MetalBackend
+
+    HAS_METAL = True
+except Exception:
+    NPUBuffer = None
+    Device = None
+    MetalBackend = None
+    HAS_METAL = False
+
+try:
+    import cupy  # noqa: F401
+
+    from cuda_runtime.cuda_backend import CUDABackend
+
+    HAS_CUPY = True
+except Exception:
+    HAS_CUPY = False
 
 
 @pytest.fixture(scope="session")
 def device():
     """Session-scoped Metal device."""
+    if not HAS_METAL:
+        pytest.skip("Metal not available")
     return Device()
+
+
+@pytest.fixture(params=["metal", "cuda"])
+def backend_type(request):
+    """Backend type fixture parameterized over available backends."""
+    if request.param == "metal" and not HAS_METAL:
+        pytest.skip("Metal not available")
+    if request.param == "cuda" and not HAS_CUPY:
+        pytest.skip("CuPy/CUDA not available")
+    return request.param
+
+
+@pytest.fixture
+def backend(backend_type):
+    """Backend instance for the current backend_type."""
+    if backend_type == "metal":
+        return MetalBackend()
+    return CUDABackend()
 
 
 @pytest.fixture

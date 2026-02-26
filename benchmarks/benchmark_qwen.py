@@ -21,6 +21,8 @@ Usage:
     python ../benchmarks/benchmark_qwen.py --repeats 5      # 5 measurements per point
     python ../benchmarks/benchmark_qwen.py --mode both --chart-dir ../docs/assets/
     python ../benchmarks/benchmark_qwen.py --comparison-chart comparison.png
+    python ../benchmarks/benchmark_qwen.py --backend cuda   # CUDA backend
+    python ../benchmarks/benchmark_qwen.py --backend both   # Metal vs CUDA comparison
 """
 
 from __future__ import annotations
@@ -434,12 +436,12 @@ def print_report(report: ScalingReport):
     print("Qwen2.5-1.5B Decode Scaling Benchmark")
     print("=" * 80)
 
-    print(f"\nEnvironment:")
+    print("\nEnvironment:")
     print(f"  Chipset:    {env.get('chipset', 'N/A')}")
     print(f"  RAM:        {env.get('ram_gb', 0):.0f} GB")
     print(f"  Metal GPU:  {env.get('metal_gpu', 'N/A')}")
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Prompt length:    {report.prompt_length} tokens")
     print(f"  Max cache length: {report.max_cache_len} tokens")
     print(f"  Compile time:     {report.compile_time_sec:.2f} sec")
@@ -459,7 +461,7 @@ def print_report(report: ScalingReport):
     _print_table("DAGExecutor (Partitioned NPU+CPU)", report.dag_results)
 
     if report.executor_results and report.dag_results:
-        print(f"\nComparison (DAG / Executor):")
+        print("\nComparison (DAG / Executor):")
         print(f"  {'Position':>10} {'Executor TPS':>14} {'DAG TPS':>10} {'Ratio':>8}")
         print("  " + "-" * 46)
         dag_by_pos = {r.position: r for r in report.dag_results}
@@ -645,6 +647,168 @@ def save_json(report: ScalingReport, output_path: str):
     print(f"  JSON results saved to {output_path}")
 
 
+def benchmark_dag_cuda_scaling(
+    positions: list[int],
+    prefill_ir_path: str,
+    decode_ir_path: str,
+    kv_mapping_path: str,
+    model_id: str,
+    input_ids: np.ndarray,
+    repeats: int = 3,
+) -> tuple[list[ScalingPoint], float]:
+    """Measure single-step CUDA DAG decode time at each cache position.
+
+    Requires CuPy. Uses CUDABackend + compile_subgraph.
+    """
+    import ml_dtypes  # noqa: F401
+
+    from cuda_compiler import compile_subgraph
+    from cuda_compiler.op_support import is_cuda_op_supported
+    from cuda_runtime.cuda_backend import CUDABackend
+    from npu_compiler.partitioner import partition
+    from npu_runtime.dag_executor import DAGExecutor
+
+    with open(prefill_ir_path) as f:
+        prefill_ir_dict = json.load(f)
+    with open(decode_ir_path) as f:
+        decode_ir_dict = json.load(f)
+    with open(kv_mapping_path) as f:
+        kv_map = json.load(f)
+
+    backend = CUDABackend()
+    prefill_plan = partition(prefill_ir_dict, is_cuda_op_supported)
+    decode_plan = partition(decode_ir_dict, is_cuda_op_supported)
+
+    prefill_dag = DAGExecutor(prefill_plan, backend, compile_fn=compile_subgraph)
+    decode_dag = DAGExecutor(decode_plan, backend, compile_fn=compile_subgraph)
+
+    from run_qwen_graph import load_numpy_weights
+
+    prefill_weights_np = load_numpy_weights(model_id, prefill_ir_dict)
+    decode_weights_np = load_numpy_weights(model_id, decode_ir_dict)
+
+    prefill_dag.load_weights(prefill_weights_np)
+    decode_dag.load_weights(decode_weights_np)
+
+    prefill_seq_len = prefill_ir_dict["graph_inputs"][0]["shape"][1]
+    first_kv_name = kv_map["layers"][0]["decode_key_input"]
+    max_cache_len = None
+    for gi in decode_ir_dict["graph_inputs"]:
+        if gi["name"] == first_kv_name:
+            max_cache_len = gi["shape"][2]
+            break
+
+    _NEG_INF = np.float16(-np.inf)
+    _FIXED_INPUTS = {"input_ids", "attention_mask", "position_ids", "cache_position"}
+
+    # Prefill
+    actual_len = min(len(input_ids), prefill_seq_len)
+    padded_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
+    padded_ids[0, :actual_len] = input_ids[:actual_len]
+
+    causal_mask = np.triu(
+        np.full((1, 1, prefill_seq_len, prefill_seq_len), _NEG_INF, dtype=np.float16),
+        k=1,
+    )
+    causal_mask[:, :, :, actual_len:] = _NEG_INF
+    causal_mask[:, :, actual_len:, :] = _NEG_INF
+
+    prefill_inputs = {
+        "input_ids": padded_ids,
+        "attention_mask": causal_mask,
+        "position_ids": np.arange(prefill_seq_len, dtype=np.int64).reshape(1, -1),
+        "cache_position": np.arange(prefill_seq_len, dtype=np.int64),
+    }
+
+    # Warmup prefill (JIT compile + buffer alloc on first call)
+    import cupy as _cp
+    for _ in range(3):
+        prefill_dag.execute(inputs=prefill_inputs)
+    _cp.cuda.Device().synchronize()
+
+    # Measure steady-state TTFT (no compilation overhead)
+    # Note: no explicit GPU sync to match Metal benchmark methodology
+    # (Metal executor blocks internally via waitUntilCompleted)
+    ttft_times = []
+    for _ in range(max(repeats, 7)):
+        _cp.cuda.Device().synchronize()  # drain prior work
+        t0 = time.perf_counter()
+        prefill_dag.execute(inputs=prefill_inputs)
+        ttft_times.append((time.perf_counter() - t0) * 1000)
+    ttft_ms = float(np.median(ttft_times))
+
+    # Build decode KV input shapes
+    decode_kv_shapes = {}
+    for gi in decode_ir_dict["graph_inputs"]:
+        if gi["name"] not in _FIXED_INPUTS:
+            decode_kv_shapes[gi["name"]] = gi["shape"]
+
+    # Pre-allocate KV cache on GPU as CUDABuffers (avoids PCIe transfer per step)
+    import cupy as cp
+
+    from cuda_runtime.cuda_backend import CUDABuffer
+
+    kv_gpu_buffers: dict[str, CUDABuffer] = {}
+    for layer in kv_map["layers"]:
+        for dkey in [layer["decode_key_input"], layer["decode_value_input"]]:
+            shape = decode_kv_shapes[dkey]
+            kv_gpu = cp.random.randn(*shape, dtype=cp.float32).astype(cp.float16)
+            kv_gpu_buffers[dkey] = CUDABuffer(kv_gpu, logical_shape=tuple(shape))
+
+    # Warmup decode (first call has allocation overhead)
+    warmup_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
+    warmup_mask[0, 0, 0, :prefill_seq_len + 1] = 0.0
+    warmup_inputs: dict = {
+        "input_ids": np.array([[1]], dtype=np.int64),
+        "attention_mask": warmup_mask,
+        "position_ids": np.array([[prefill_seq_len]], dtype=np.int64),
+        "cache_position": np.array([prefill_seq_len], dtype=np.int64),
+    }
+    warmup_inputs.update(kv_gpu_buffers)
+    for _ in range(3):
+        decode_dag.execute(inputs=warmup_inputs)
+    _cp.cuda.Device().synchronize()
+
+    results = []
+    for pos in positions:
+        cur_pos = prefill_seq_len + pos - 1
+
+        decode_mask = np.full((1, 1, 1, max_cache_len), _NEG_INF, dtype=np.float16)
+        decode_mask[0, 0, 0, : cur_pos + 1] = 0.0
+
+        step_inputs: dict = {
+            "input_ids": np.array([[1]], dtype=np.int64),
+            "attention_mask": decode_mask,
+            "position_ids": np.array([[cur_pos]], dtype=np.int64),
+            "cache_position": np.array([cur_pos], dtype=np.int64),
+        }
+        # Pass KV cache as GPU DeviceBuffers (zero-copy, no PCIe transfer)
+        step_inputs.update(kv_gpu_buffers)
+
+        times_ms = []
+        for _ in range(repeats):
+            _cp.cuda.Device().synchronize()  # drain prior work
+            t0 = time.perf_counter()
+            decode_dag.execute(inputs=step_inputs)
+            times_ms.append((time.perf_counter() - t0) * 1000)
+
+        median_ms = float(np.median(times_ms))
+        std_ms = float(np.std(times_ms))
+        tps = 1000.0 / median_ms if median_ms > 0 else 0
+
+        pt = ScalingPoint(
+            position=pos,
+            step_time_ms=median_ms,
+            step_time_std_ms=std_ms,
+            tps=tps,
+            ttft_ms=ttft_ms,
+        )
+        results.append(pt)
+        print(f"    pos={pos:>6}: {median_ms:.1f}ms (TPS={tps:.1f})")
+
+    return results, ttft_ms
+
+
 def _build_prompt_tokens(tokenizer, prompt_length: int) -> np.ndarray:
     """Generate token IDs of approximately the target length."""
     base = "The quick brown fox jumps over the lazy dog. "
@@ -697,10 +861,21 @@ def main():
         default=MODEL_MAX_POSITION_EMBEDDINGS,
         help=f"Max KV cache length (default: {MODEL_MAX_POSITION_EMBEDDINGS}, model max_position_embeddings)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["metal", "cuda", "both"],
+        default="metal",
+        help="Backend to use for DAG benchmark: metal (default), cuda, or both (comparison)",
+    )
     args = parser.parse_args()
 
     run_executor = args.mode in ("executor", "both")
     run_dag = args.mode in ("dag", "both")
+
+    # CUDA-only mode: skip Metal executor benchmark
+    if args.backend == "cuda":
+        run_executor = False
+        run_dag = True
     report = ScalingReport()
     report.prompt_length = args.prompt_length
 
@@ -727,8 +902,12 @@ def main():
     # 4. Compile
     print("Compiling IR...")
     import npu_compiler
-    from npu_runtime.device import Device
-    from npu_runtime.executor import Executor
+
+    needs_metal = args.backend in ("metal", "both") or run_executor
+
+    if needs_metal:
+        from npu_runtime.device import Device
+        from npu_runtime.executor import Executor
 
     t0 = time.perf_counter()
     prefill_program = npu_compiler.compile(args.prefill_ir)
@@ -754,13 +933,20 @@ def main():
 
     # 5. Load weights
     print("Loading weights...")
-    from hf_utils import load_weights_from_hf
 
-    device = Device()
+    if needs_metal:
+        from hf_utils import load_weights_from_hf
 
-    t0 = time.perf_counter()
-    prefill_weights = load_weights_from_hf(args.model_id, prefill_program, device)
-    decode_weights = load_weights_from_hf(args.model_id, decode_program, device)
+        device = Device()
+
+        t0 = time.perf_counter()
+        prefill_weights = load_weights_from_hf(args.model_id, prefill_program, device)
+        decode_weights = load_weights_from_hf(args.model_id, decode_program, device)
+    else:
+        device = None
+        t0 = time.perf_counter()
+        prefill_weights = None
+        decode_weights = None
     report.weight_load_time_sec = time.perf_counter() - t0
     print(f"  Weight load time: {report.weight_load_time_sec:.2f}s")
 
@@ -787,10 +973,10 @@ def main():
             repeats=args.repeats,
         )
 
-    # 7. DAGExecutor benchmark
-    if run_dag:
+    # 7. DAGExecutor benchmark (Metal)
+    if run_dag and args.backend in ("metal", "both"):
         print(f"\n{'=' * 60}")
-        print("Benchmarking DAGExecutor (Partitioned NPU+CPU)")
+        print("Benchmarking DAGExecutor (Metal NPU+CPU)")
         print(f"{'=' * 60}")
 
         report.dag_results, _ = benchmark_dag_scaling(
@@ -802,6 +988,36 @@ def main():
             input_ids=input_ids,
             repeats=args.repeats,
         )
+
+    # 7b. DAGExecutor benchmark (CUDA)
+    if run_dag and args.backend in ("cuda", "both"):
+        try:
+            import cupy  # noqa: F401
+
+            print(f"\n{'=' * 60}")
+            print("Benchmarking DAGExecutor (CUDA GPU)")
+            print(f"{'=' * 60}")
+
+            cuda_dag_results, _ = benchmark_dag_cuda_scaling(
+                positions=positions,
+                prefill_ir_path=args.prefill_ir,
+                decode_ir_path=args.decode_ir,
+                kv_mapping_path=args.kv_mapping,
+                model_id=args.model_id,
+                input_ids=input_ids,
+                repeats=args.repeats,
+            )
+
+            if args.backend == "cuda":
+                # Use CUDA results as the primary DAG results
+                report.dag_results = cuda_dag_results
+            else:
+                # Both: print CUDA results separately
+                print("\nCUDA DAG Results:")
+                for r in cuda_dag_results:
+                    print(f"  pos={r.position:>6}: {r.step_time_ms:.1f}ms (TPS={r.tps:.1f})")
+        except ImportError:
+            print("  [WARN] CuPy not installed, skipping CUDA benchmark")
 
     # 8. Report
     print_report(report)

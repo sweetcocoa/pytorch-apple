@@ -11,9 +11,16 @@ import torch.nn as nn
 from torch_ir import extract_ir
 
 import npu_compiler
-from npu_runtime.buffer import NPUBuffer
-from npu_runtime.executor import Executor
-from npu_runtime.weight_loader import load_weights
+
+try:
+    from npu_runtime.buffer import NPUBuffer
+    from npu_runtime.executor import Executor
+    from npu_runtime.weight_loader import load_weights
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
+pytestmark = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 
 # ─── Simple ConvNet (matches torch_to_ir example) ───
 

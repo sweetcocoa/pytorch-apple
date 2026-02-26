@@ -214,3 +214,22 @@ outputs = executor.run(inputs, weights)
 | `compile()` API에 `CodegenTarget` 파라미터 미연결 가능 | `__init__.py` | 연결 확인 필요 |
 
 핵심 요약: **컴파일러 변경은 최소** (CodegenTarget 구현 + TargetConfig 인스턴스), **런타임은 3개 파일 신규 작성** (buffer, executor, backend). 기존 Metal 코드는 변경 불필요.
+
+## 구현 사례: CUDA 백엔드
+
+CUDA 백엔드가 레퍼런스로 구현되어 있습니다. Metal 백엔드(기존 op 수준 코드 생성 재사용)와 달리, CUDA 백엔드는 **서브그래프 수준** 접근 방식을 보여줍니다:
+
+| 구성 요소 | 파일 | 접근 방식 |
+|-----------|------|-----------|
+| 컴파일러 | `cuda_compiler/` (7개 파일) | 서브그래프 분석 + 탐욕적 elementwise 퓨전 + NVRTC JIT |
+| 런타임 | `cuda_runtime/` (2개 파일) | CuPy 기반: cuBLAS (BLAS용), RawKernel (퓨전 커널용) |
+| DAGExecutor | `npu_runtime/dag_executor.py` | `compile_fn` 파라미터로 확장 |
+
+핵심 설계 결정:
+
+- **채널 패딩 불필요**: CUDA는 64바이트 정렬 제약이 없음 (Metal과 다름)
+- **탐욕적 퓨전**: 단일 소비자 elementwise op 체인 중 형상이 일치하면 하나의 커널로 퓨전
+- **CuPy 경유 BLAS**: GEMM에 `cp.matmul()` 사용, 커스텀 matmul 커널 불필요
+- **초기화 시 JIT**: 모든 NVRTC 컴파일은 `CUDAExecutor.__init__()`에서 수행
+
+자세한 내용은 [CUDA 백엔드 가이드](cuda-backend.md)를 참조하세요.

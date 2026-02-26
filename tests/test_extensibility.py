@@ -26,7 +26,12 @@ from npu_compiler.fusion_patterns import (
 from npu_compiler.ir_reader import OpNode, TensorSpec, load_ir_from_dict
 from npu_compiler.target_config import TargetConfig
 from npu_runtime.backend import Backend, DeviceBuffer
-from npu_runtime.executor import DispatchStrategy, MetalDispatchStrategy
+
+try:
+    from npu_runtime.executor import DispatchStrategy, MetalDispatchStrategy
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +126,7 @@ class TestCodegenTargetABC:
 # 3. DispatchStrategy ABC (D)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 class TestDispatchStrategyABC:
     """DispatchStrategy defines pluggable grid/threadgroup computation."""
 
@@ -175,6 +181,7 @@ class TestDeviceBufferABC:
         assert hasattr(DeviceBuffer, "native_handle")
         assert hasattr(DeviceBuffer, "to_numpy")
 
+    @pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
     def test_npu_buffer_is_device_buffer(self):
         """NPUBuffer is a concrete DeviceBuffer."""
         from npu_runtime.buffer import NPUBuffer
@@ -197,10 +204,21 @@ class TestBackendABC:
         assert hasattr(Backend, "create_executor")
         assert hasattr(Backend, "synchronize")
 
+    @pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
     def test_metal_backend_is_backend(self):
         """MetalBackend implements the Backend interface."""
         from npu_runtime.metal_backend import MetalBackend
         assert issubclass(MetalBackend, Backend)
+
+    def test_cuda_backend_is_backend(self):
+        """CUDABackend implements the Backend interface."""
+        from cuda_runtime.cuda_backend import CUDABackend
+        assert issubclass(CUDABackend, Backend)
+
+    def test_cuda_buffer_is_device_buffer(self):
+        """CUDABuffer is a concrete DeviceBuffer."""
+        from cuda_runtime.cuda_backend import CUDABuffer
+        assert issubclass(CUDABuffer, DeviceBuffer)
 
 
 # ---------------------------------------------------------------------------

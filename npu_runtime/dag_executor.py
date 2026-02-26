@@ -7,7 +7,7 @@ Backend's upload/download methods.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
@@ -15,9 +15,15 @@ import npu_compiler
 from npu_compiler.compiled_program import CompiledProgram
 from npu_compiler.partitioner import Partition, PartitionPlan, TransferOp
 from npu_runtime.backend import Backend, DeviceBuffer
-from npu_runtime.buffer import NPUBuffer
+
 from npu_runtime.cpu_fallback import build_cpu_executor, execute_cpu_partition_cached
-from npu_runtime.weight_loader import load_weights
+
+try:
+    from npu_runtime.buffer import NPUBuffer
+    from npu_runtime.weight_loader import load_weights
+except ImportError:
+    NPUBuffer = None  # type: ignore[assignment,misc]
+    load_weights = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from torch_ir import IR, IRExecutor
@@ -30,9 +36,15 @@ class DAGExecutor:
     torch_ir's ATen fallback for CPU partitions.
     """
 
-    def __init__(self, plan: PartitionPlan, backend: Backend):
+    def __init__(
+        self,
+        plan: PartitionPlan,
+        backend: Backend,
+        compile_fn: Callable[[dict], Any] | None = None,
+    ):
         self.plan = plan
         self.backend = backend
+        self._compile_fn = compile_fn or npu_compiler.compile
         self.npu_programs: dict[int, CompiledProgram] = {}
         self._npu_executors: dict[int, object] = {}
         self._npu_weight_cache: dict[int, dict[str, DeviceBuffer]] = {}
@@ -55,7 +67,7 @@ class DAGExecutor:
         for step in plan.steps:
             if isinstance(step, Partition) and step.target == "npu":
                 sub_ir_dict = _build_sub_ir_dict(step, plan.original_ir)
-                program = npu_compiler.compile(sub_ir_dict)
+                program = self._compile_fn(sub_ir_dict)
                 self.npu_programs[step.partition_id] = program
                 self._npu_executors[step.partition_id] = backend.create_executor(program)
             elif isinstance(step, Partition) and step.target == "cpu":
@@ -91,14 +103,49 @@ class DAGExecutor:
         for step in self.plan.steps:
             if isinstance(step, Partition) and step.target == "npu":
                 program = self.npu_programs[step.partition_id]
-                bufs: dict[str, NPUBuffer] = {}
+                bufs: dict[str, DeviceBuffer] = {}
                 for spec in program.input_specs:
-                    bufs[spec.name] = NPUBuffer.zeros(
-                        tuple(spec.shape),
-                        self.backend.device,
-                        alloc_shape=tuple(spec.alloc_shape) if spec.alloc_shape else None,
-                    )
+                    if NPUBuffer is not None:
+                        bufs[spec.name] = NPUBuffer.zeros(
+                            tuple(spec.shape),
+                            self.backend.device,
+                            alloc_shape=tuple(spec.alloc_shape) if spec.alloc_shape else None,
+                        )
+                    else:
+                        bufs[spec.name] = self.backend.allocate_zeros(tuple(spec.shape), dtype=np.dtype(np.float16))
                 self._npu_input_buffers[step.partition_id] = bufs
+
+    def _load_weights_for_backend(
+        self, weights: dict[str, np.ndarray], program: Any
+    ) -> dict[str, DeviceBuffer]:
+        """Load weights using Metal weight_loader or generic backend upload."""
+        if load_weights is not None:
+            return load_weights(weights, program, self.backend.device)
+
+        # Generic path: upload weights directly via backend (CUDA, etc.)
+        # Convert to compute dtype (float16 for CUDA kernels)
+        compute_dtype = getattr(program, "compute_dtype", "float16")
+        np_dtype = np.float16 if compute_dtype in ("float16", "bfloat16") else np.float32
+
+        reverse_map: dict[str, str] = {}
+        if hasattr(program, "weight_name_mapping"):
+            for placeholder, sd_key in program.weight_name_mapping.items():
+                reverse_map[sd_key] = placeholder
+        buffers: dict[str, DeviceBuffer] = {}
+        for w_spec in program.weight_specs:
+            sd_key = w_spec.name
+            placeholder = reverse_map.get(sd_key, sd_key)
+            if sd_key in weights:
+                arr = weights[sd_key]
+            elif placeholder in weights:
+                arr = weights[placeholder]
+            else:
+                continue
+            # Cast to compute dtype before upload
+            if arr.dtype != np_dtype:
+                arr = arr.astype(np_dtype)
+            buffers[placeholder] = self.backend.allocate_buffer(arr)
+        return buffers
 
     def load_weights(self, weights: dict[str, np.ndarray]) -> None:
         """Pre-load and cache weights for all NPU partitions."""
@@ -107,10 +154,8 @@ class DAGExecutor:
         for step in self.plan.steps:
             if isinstance(step, Partition) and step.target == "npu":
                 program = self.npu_programs[step.partition_id]
-                self._npu_weight_cache[step.partition_id] = load_weights(
-                    weights,
-                    program,
-                    self.backend.device,
+                self._npu_weight_cache[step.partition_id] = self._load_weights_for_backend(
+                    weights, program
                 )
 
         # Cache CPU partition executors

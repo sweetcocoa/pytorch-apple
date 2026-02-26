@@ -112,3 +112,49 @@ Stride of 0 means broadcast along that dimension.
 | `conv_bn_relu.metal` | `conv2d_kernel` | Conv2d with optional BN+ReLU |
 | `add_relu.metal` | `add_kernel`, `add_relu_kernel` | Add with optional ReLU |
 | `pool.metal` | `max_pool2d_kernel`, `adaptive_avg_pool2d_kernel` | Pooling |
+
+## CUDA Kernels
+
+The CUDA backend generates kernels via two mechanisms:
+
+### 1. Fused Elementwise Kernels (codegen)
+
+Generated at compile time by `cuda_compiler.cuda_codegen.generate_fused_kernel()`. Chains of elementwise ops (relu, silu, add, mul, div, neg, pow, rsqrt, cos, sin) are fused into a single CUDA C kernel and JIT-compiled via NVRTC.
+
+Example: `silu(gate) * up` generates:
+```cuda
+__global__ void fused_ew_0(const __half* in0, const __half* in1,
+                           __half* out0, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    __half v0 = in0[idx];
+    __half v1 = (v0 / ((__half)1.0 + hexp(-v0)));  // silu
+    __half v2 = in1[idx];
+    out0[idx] = (v1 * v2);                          // mul
+}
+```
+
+### 2. Pre-written Template Kernels
+
+Defined in `cuda_compiler/cuda_templates.py`:
+
+| Template | Operations |
+|----------|-----------|
+| `softmax_kernel` | Numerically stable softmax (max, exp, sum, normalize) |
+| `mean_last_dim_kernel` | Mean reduction on last dimension |
+| `embedding_kernel` | Token embedding lookup |
+| `rope_kernel` | Rotary position embedding |
+| `index_copy_kernel` | KV cache position update |
+| `conv2d_kernel` | Conv2d (direct implementation) |
+| `batch_norm_kernel` | Batch normalization |
+| `max_pool2d_kernel` | Max pooling |
+| `adaptive_avg_pool2d_kernel` | Adaptive average pooling |
+| `transpose_kernel` | N-dim transpose |
+| `cat_2_kernel` | 2-input concatenation |
+| `slice_kernel` | Tensor slicing |
+| `expand_kernel` | Broadcast expansion |
+| `full_kernel` | Constant fill |
+
+### 3. cuBLAS (via CuPy)
+
+BLAS operations (matmul, linear, bmm, conv2d) use `cupy.matmul()` which dispatches to cuBLAS internally. No custom CUDA kernels needed for GEMM.

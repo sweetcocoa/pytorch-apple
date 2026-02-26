@@ -1,6 +1,6 @@
 # NPU Simulation
 
-NPU compiler/runtime backend that compiles PyTorch IR to Metal compute shaders, simulating NPU execution on Mac Apple Silicon GPU.
+NPU compiler/runtime backend that compiles PyTorch IR to Metal compute shaders (macOS) or CUDA kernels (NVIDIA GPU), simulating NPU execution.
 
 ## Supported Models
 
@@ -13,8 +13,11 @@ NPU compiler/runtime backend that compiles PyTorch IR to Metal compute shaders, 
 ## Quick Start
 
 ```bash
-# Install
+# Install (Metal backend, macOS)
 uv sync --extra dev
+
+# Install (CUDA backend, Linux/Windows with NVIDIA GPU)
+uv sync --extra dev --extra cuda
 
 # Run tests
 uv run pytest tests/ -v
@@ -28,20 +31,24 @@ cd examples && uv run python run_qwen_graph.py --prompt "Hello"
 
 ```
 PyTorch Model → torch_to_ir → IR JSON ─┬─→ compile()  → .npubin → Executor → Metal GPU
-                                        └─→ partition() → DAGExecutor → NPU + CPU mixed
+                                        ├─→ partition() → DAGExecutor → NPU + CPU mixed (Metal)
+                                        └─→ partition() → DAGExecutor → CUDA + CPU mixed (CUDA)
 ```
 
-### Compiler (offline)
-- IR loading, constraint validation, BN folding
+### Metal Backend (macOS)
+- Op-level codegen: 1 ATen op → 1 Metal kernel
 - Op fusion: Conv+BN+ReLU, Add+ReLU, RMSNorm, SiLU+Gate, Masked Softmax
-- Broadcast folding, transpose folding into MPS matmul
-- **Graph partitioning**: splits IR into NPU/CPU partitions for models with unsupported ops
-
-### Runtime (online)
 - MPS-accelerated matmul (float16 + bfloat16)
-- Pre-compiled shaders, pre-packed parameters
-- Single command buffer batching
-- **DAGExecutor**: mixed NPU + CPU fallback execution via Backend ABC
+
+### CUDA Backend (NVIDIA GPU)
+- Subgraph-level codegen: N elementwise ops → 1 fused CUDA kernel
+- Greedy elementwise chain fusion (silu+mul, add+relu, etc.)
+- cuBLAS for GEMM via CuPy, NVRTC JIT for custom kernels
+
+### Common
+- IR loading, constraint validation, BN folding, graph partitioning
+- **DAGExecutor**: mixed GPU + CPU fallback execution via Backend ABC
+- `compile_fn` parameter selects Metal or CUDA compilation
 
 ## Performance Optimizations
 

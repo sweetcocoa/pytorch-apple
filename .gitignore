@@ -39,3 +39,4 @@ benchmarks/*.png
 
 # MkDocs build
 site/
+CLAUDE.md
